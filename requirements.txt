@@ -1,1 +1,8 @@
+pandas
+numpy
 streamlit
+pyyaml
+fastapi
+pydantic
+ortools
+requests
