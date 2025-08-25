@@ -57,15 +57,27 @@ def set_current_user(user):
     else:
         st.session_state["_current_user"] = user
 
+def _valid_url(u: str | None) -> bool:
+    return bool(u) and u.strip().lower().startswith(("http://", "https://"))
+
 def resolve_org_webhook(orgs_df: pd.DataFrame | None, org_id: str) -> str | None:
+    # 1) CSV de organizaciones
     if orgs_df is not None and not orgs_df.empty and "org_id" in orgs_df.columns:
         row = orgs_df[orgs_df["org_id"].astype(str) == str(org_id)]
         if not row.empty and "slack_webhook" in row.columns:
             val = str(row["slack_webhook"].iloc[0]).strip()
-            if val:
+            if val and val.lower() != "nan" and _valid_url(val):
                 return val
+    # 2) Secrets en Streamlit
+    try:
+        val = st.secrets.get("SLACK_WEBHOOK_URL", "")  # type: ignore[attr-defined]
+        if _valid_url(val):
+            return val.strip()
+    except Exception:
+        pass
+    # 3) Variable de entorno
     env = os.getenv("SLACK_WEBHOOK_URL", "").strip()
-    return env or None
+    return env if _valid_url(env) else None
 
 # ---------- Registro (sin hard-codear la clave) ----------
 
@@ -143,7 +155,7 @@ def _run_generator_register(email: str, password: str, org_name: str, stores: in
 def register_ui(data_dir: Path):
     users_df, _, _, _ = load_account_tables(data_dir)
 
-    with st.sidebar.expander("Crear cuenta (panel)", expanded=False):
+    with st.sidebar.expander("Crear cuenta", expanded=False):
         org_name = st.text_input("Nombre de la organización", placeholder="Mi Retail, S.A.")
         email = st.text_input("Email de acceso", placeholder="usuario@miempresa.com")
         pwd1 = st.text_input("Contraseña", type="password")

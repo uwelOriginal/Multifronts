@@ -16,7 +16,9 @@ from services.slack_notify import send_slack_notifications
 from services.auth import load_account_tables, resolve_org_webhook
 from services.guardrails import enforce_orders_scope, enforce_transfers_scope, filter_distances_to_scope
 from optimizer import suggest_transfers
-from notifier import write_orders_csv, write_transfers_csv, log_notifications
+# --- Cambios: reemplazamos persistencia CSV por BD ---
+from services import repo
+import time
 from datetime import datetime, timezone
 
 def _now_utc_iso() -> str:
@@ -69,22 +71,29 @@ class OperationView(BaseView):
             st.info("No hay pedidos sugeridos bajo los filtros.")
             return
         orders_disp = attach_store_label(orders, self.ctx.stores, label_col="Sucursal")
-        selected_order_ids = render_selectable_editor(
-            df=orders_disp,
-            id_cols=["store_id", "sku_id"],
-            display_cols=["Sucursal", "sku_id", "on_hand_units", "ROP", "S_level", "suggested_order_qty"],
-            key="orders_tbl",
-            approve_label="Aprobar",
-            height_px=360,
-            rename_func=nice_headers,
-        )
-        if st.button("✓ Aprobar pedidos seleccionados"):
+
+        # ⬇️ Formulario: evitar rerun por cada clic en casillas
+        with st.form("orders_form"):
+            selected_order_ids = render_selectable_editor(
+                df=orders_disp,
+                id_cols=["store_id", "sku_id"],
+                display_cols=["Sucursal", "sku_id", "on_hand_units", "ROP", "S_level", "suggested_order_qty"],
+                key="orders_tbl",
+                approve_label="Aprobar",
+                height_px=360,
+                rename_func=nice_headers,
+            )
+            approve_orders = st.form_submit_button("✓ Aprobar pedidos seleccionados")
+
+        if approve_orders:
             chosen = selection_to_dataframe(orders, selected_order_ids, ["store_id", "sku_id"])[
                 ["store_id", "sku_id", "on_hand_units", "ROP", "S_level", "suggested_order_qty"]
             ].copy()
             if chosen.empty:
                 st.info("No quedó ningún pedido seleccionado.")
                 return
+
+            # Preparación para BD
             out = chosen.rename(columns={"suggested_order_qty": "qty"})
             out_valid, out_block = enforce_orders_scope(out, self.ctx.allowed_stores, self.ctx.allowed_skus)
             if not out_block.empty:
@@ -92,21 +101,35 @@ class OperationView(BaseView):
             if out_valid.empty:
                 st.info("No quedó ningún pedido válido para aprobar.")
                 return
+
+            # Datos para notificación (con metadatos)
+            out_valid = out_valid.copy()
             out_valid["org_id"] = self.ctx.org_id
             out_valid["actor"] = self.ctx.actor_email
             out_valid["ts_iso"] = _now_utc_iso()
-            path = write_orders_csv(out_valid, path=self.ctx.DATA_DIR / "orders_confirmed.csv")
+
+            # Persistencia en BD (idempotente)
+            rows_db = out_valid[["store_id", "sku_id", "qty"]].to_dict(orient="records")
+            idem_prefix = f"{self.ctx.org_id}:{self.ctx.actor_email}:{int(time.time())}"
+            nuevos, duplicados = repo.save_orders(
+                org_id=self.ctx.org_id,
+                rows=rows_db,
+                approved_by=self.ctx.actor_email,
+                idem_prefix=idem_prefix,
+            )
+
+            # Slack (si hay webhook configurado)
             notif_now = out_valid.copy()
             notif_now.insert(0, "kind", "order")
-            log_notifications(notif_now.to_dict(orient="records"), path=self.ctx.DATA_DIR / "notifications.csv")
-            st.session_state["movements_this_session"] = True
             webhook = resolve_org_webhook(load_account_tables(self.ctx.DATA_DIR)[1], self.ctx.org_id)
             if webhook:
                 ok, msg = send_slack_notifications(notif_now, webhook)
                 st.toast(msg, icon="✅" if ok else "⚠️")
             else:
                 st.toast("No hay Slack webhook configurado (org o env).", icon="⚠️")
-            st.success(f"Pedidos confirmados escritos en {path}")
+
+            st.session_state["movements_this_session"] = True
+            st.success(f"Órdenes guardadas en BD: {nuevos} nuevas, {duplicados} duplicadas (omitidas).")
 
     def _transfers(self, enriched: pd.DataFrame):
         distances_scoped = filter_distances_to_scope(self.ctx.distances, self.ctx.allowed_stores) \
@@ -126,42 +149,60 @@ class OperationView(BaseView):
         transfers_disp["De"] = transfers_disp["from_store"].map(self.ctx.id_to_label)
         transfers_disp["A"]  = transfers_disp["to_store"].map(self.ctx.id_to_label)
 
-        selected_transfer_ids = render_selectable_editor(
-            df=transfers_disp,
-            id_cols=["sku_id", "from_store", "to_store"],
-            display_cols=["sku_id", "De", "A", "qty", "distance_km"] + (["cost_est"] if "cost_est" in transfers_disp.columns else []),
-            key="transfers_tbl",
-            approve_label="Aprobar",
-            height_px=360,
-            rename_func=nice_headers,
-        )
-        if st.button("✓ Aprobar transferencias seleccionadas"):
+        # ⬇️ Formulario: evitar rerun por cada clic en casillas
+        with st.form("transfers_form"):
+            selected_transfer_ids = render_selectable_editor(
+                df=transfers_disp,
+                id_cols=["sku_id", "from_store", "to_store"],
+                display_cols=["sku_id", "De", "A", "qty", "distance_km"] + (["cost_est"] if "cost_est" in transfers_disp.columns else []),
+                key="transfers_tbl",
+                approve_label="Aprobar",
+                height_px=360,
+                rename_func=nice_headers,
+            )
+            approve_transfers = st.form_submit_button("✓ Aprobar transferencias seleccionadas")
+
+        if approve_transfers:
             chosen_t = selection_to_dataframe(transfers, selected_transfer_ids, ["sku_id", "from_store", "to_store"])
             if chosen_t.empty:
                 st.info("No quedó ninguna transferencia seleccionada.")
                 return
+
             valid_t, blocked_t = enforce_transfers_scope(chosen_t, self.ctx.allowed_stores, self.ctx.allowed_skus)
             if not blocked_t.empty:
                 st.warning(f"Se bloquearon {len(blocked_t)} transferencia(s) por reglas de organización.")
             if valid_t.empty:
                 st.info("No quedó ninguna transferencia válida para aprobar.")
                 return
+
+            # Datos para notificación (con metadatos)
             out_t = valid_t.copy()
             out_t["org_id"] = self.ctx.org_id
             out_t["actor"] = self.ctx.actor_email
             out_t["ts_iso"] = _now_utc_iso()
-            path_t = write_transfers_csv(out_t, path=self.ctx.DATA_DIR / "transfers_confirmed.csv")
+
+            # Persistencia en BD (idempotente)
+            rows_db_t = out_t[["from_store", "to_store", "sku_id", "qty"]].to_dict(orient="records")
+            idem_prefix = f"{self.ctx.org_id}:{self.ctx.actor_email}:{int(time.time())}"
+            nuevos, duplicados = repo.save_transfers(
+                org_id=self.ctx.org_id,
+                rows=rows_db_t,
+                approved_by=self.ctx.actor_email,
+                idem_prefix=idem_prefix,
+            )
+
+            # Slack (si hay webhook configurado)
             notif_now = out_t.copy()
             notif_now.insert(0, "kind", "transfer")
-            log_notifications(notif_now.to_dict(orient="records"), path=self.ctx.DATA_DIR / "notifications.csv")
-            st.session_state["movements_this_session"] = True
             webhook = resolve_org_webhook(load_account_tables(self.ctx.DATA_DIR)[1], self.ctx.org_id)
             if webhook:
                 ok, msg = send_slack_notifications(notif_now, webhook)
                 st.toast(msg, icon="✅" if ok else "⚠️")
             else:
                 st.toast("No hay Slack webhook configurado (org o env).", icon="⚠️")
-            st.success(f"Transferencias confirmadas escritas en {path_t}")
+
+            st.session_state["movements_this_session"] = True
+            st.success(f"Transferencias guardadas en BD: {nuevos} nuevas, {duplicados} duplicadas (omitidas).")
 
     def _detail(self, enriched: pd.DataFrame):
         if self.mode != "Técnico":

@@ -166,3 +166,8 @@ cython_debug/
 # Data Folder - Automatic generation
 # run in terminal: python generate_data.py
 data/
+
+# Evitar leak de credenciales
+.env
+scripts/setenv.local.sh
+.streamlit/secrets.toml

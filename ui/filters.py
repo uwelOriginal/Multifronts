@@ -28,25 +28,20 @@ class FilterPanel:
             st.session_state.setdefault(f"{self.k}{name}", val)
 
     def _clear_query_param_reset(self):
-        # API moderna
         try:
             if "reset" in st.query_params:
-                # Eliminar y volver a cargar sin el param
                 qp = dict(st.query_params)
                 qp.pop("reset", None)
                 try:
-                    # Streamlit >= 1.30
                     st.query_params.clear()
                     for k, v in qp.items():
                         st.query_params[k] = v
                 except Exception:
-                    # Fallback API antigua
                     st.experimental_set_query_params(**qp)
         except Exception:
             pass
 
     def _reset_now(self):
-        # Eliminar keys de widgets y recargar
         for name in ["stores","cats","abc_a","abc_b","abc_c","service","s_factor"]:
             st.session_state.pop(f"{self.k}{name}", None)
         self._clear_query_param_reset()
@@ -57,46 +52,64 @@ class FilterPanel:
             if st.query_params.get("reset") == "1":
                 self._reset_now()
         except Exception:
-            # Fallback para API antigua
-            from urllib.parse import parse_qs, urlparse
-            # No hay soporte directo; ignoramos silenciosamente
             pass
 
     def render(self, mode: str, default_expand: bool = True) -> FilterState:
-        # 1) Si viene reset=1 en la URL, resetear ANTES de widgets
+        # 1) Reset por query param antes de instanciar widgets
         self._check_reset_param()
 
-        # 2) Defaults antes de instanciar widgets
+        # 2) Defaults sólo en session_state
         self._ensure_defaults()
         defaults = self._defaults()
 
-        # 3) Ancla para el botón "Filtros" del topbar
+        # 2.1) Normaliza estado EXISTENTE antes de crear widgets (seguro en Streamlit)
+        store_key = f"{self.k}stores"
+        cat_key   = f"{self.k}cats"
+
+        # Normalizar sucursales: elimina labels inexistentes; si queda vacío, usa todas
+        if isinstance(st.session_state.get(store_key, None), list):
+            st.session_state[store_key] = [x for x in st.session_state[store_key] if x in defaults["stores"]]
+            if not st.session_state[store_key]:
+                st.session_state[store_key] = list(defaults["stores"])
+        else:
+            st.session_state[store_key] = list(defaults["stores"])
+
+        # Normalizar categorías
+        if isinstance(st.session_state.get(cat_key, None), list):
+            st.session_state[cat_key] = [x for x in st.session_state[cat_key] if x in defaults["cats"]]
+            # si no hay categorías disponibles, deja lista vacía; si hay, usa todas
+            if defaults["cats"] and not st.session_state[cat_key]:
+                st.session_state[cat_key] = list(defaults["cats"])
+        else:
+            st.session_state[cat_key] = list(defaults["cats"])
+
         st.markdown('<span id="filters-start"></span>', unsafe_allow_html=True)
 
-        with st.expander("Parámetros & Filtros", expanded=default_expand):
+        with st.expander("Parámetros & Filtros", expanded=False):
             # ---------- Fila 1: Sucursales y Categorías ----------
             c1, c2 = st.columns([1.6, 1.4])
 
             store_labels_sel = c1.multiselect(
                 "Sucursales",
                 options=defaults["stores"],
-                default=st.session_state[f"{self.k}stores"],
                 help="Filtra tiendas visibles (etiquetas locales a tu organización, p.ej. S01 — CDMX).",
-                key=f"{self.k}stores",
+                key=store_key,
             )
-            if not store_labels_sel:
-                store_labels_sel = defaults["stores"]
-            store_sel = [self.ctx.label_to_id[lbl] for lbl in store_labels_sel]
+            # Fallback local si el usuario deja vacío: aplica 'todas' SIN escribir session_state
+            effective_store_labels = store_labels_sel or defaults["stores"]
+            if not store_labels_sel and defaults["stores"]:
+                c1.caption("Sin selección ⇒ **todas** las sucursales.")
+            store_sel = [self.ctx.label_to_id[lbl] for lbl in effective_store_labels]
 
             cat_sel = c2.multiselect(
                 "Categorías",
                 options=defaults["cats"],
-                default=st.session_state[f"{self.k}cats"],
                 help="Familias de producto (puedes combinarlas con ABC para priorizar).",
-                key=f"{self.k}cats",
+                key=cat_key,
             )
-            if not cat_sel:
-                cat_sel = defaults["cats"]
+            effective_cats = cat_sel or defaults["cats"]
+            if not cat_sel and defaults["cats"]:
+                c2.caption("Sin selección ⇒ **todas** las categorías.")
 
             # ---------- Fila 2: ABC (toggles) ----------
             t1, t2, t3 = st.columns(3)
@@ -113,13 +126,13 @@ class FilterPanel:
                 a1, a2 = st.columns(2)
                 service_level = a1.slider(
                     "Nivel de servicio (z implícito)",
-                    0.80, 0.99, st.session_state[f"{self.k}service"], 0.01,
+                    0.80, 0.99, step=0.01,
                     help="Objetivo de fill-rate; determina el factor z del stock de seguridad en ROP.",
                     key=f"{self.k}service",
                 )
                 order_up_factor = a2.number_input(
                     "Factor S (× μ_LT)",
-                    min_value=0.1, max_value=3.0, value=st.session_state[f"{self.k}s_factor"], step=0.1,
+                    min_value=0.1, max_value=3.0, step=0.1,
                     help="Multiplicador para el nivel S (hasta dónde reponer sobre la demanda del lead time).",
                     key=f"{self.k}s_factor",
                 )
@@ -131,13 +144,12 @@ class FilterPanel:
 
         return FilterState(
             store_sel=store_sel,
-            cat_sel=cat_sel,
+            cat_sel=effective_cats,
             abc_sel=abc_sel,
-            service_level=float(service_level),
-            order_up_factor=float(order_up_factor),
+            service_level=float(st.session_state[f"{self.k}service"]),
+            order_up_factor=float(st.session_state[f"{self.k}s_factor"]),
         )
 
-    # Motor de filtrado (igual que antes)
     def apply_to(self,
                  df_sales: pd.DataFrame,
                  df_inv: pd.DataFrame,

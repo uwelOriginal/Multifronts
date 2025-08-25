@@ -1,27 +1,35 @@
-from fastapi import FastAPI
+# api.py
+import os, json, time
+from typing import List, Dict, Any
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from typing import List, Optional
+from services import repo, events
 
-app = FastAPI(title="Inventory MVP API", version="0.1.0")
+app = FastAPI(title="Multifronts Events API", version="0.1.0")
 
-class ForecastRequest(BaseModel):
-    store_id: str
-    sku_id: str
-    horizon_days: int = 14
+class PublishIn(BaseModel):
+    org_id: str
+    type: str          # e.g., "order_approved" | "transfer_approved" | "note"
+    payload: Dict[str, Any] = {}
 
-class ForecastResponse(BaseModel):
-    store_id: str
-    sku_id: str
-    horizon_days: int
-    method: str = "avg_28d"
-    daily_forecast: List[float]
+@app.on_event("startup")
+def on_start():
+    repo.init_db()   # crea tablas si no existen
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"ok": True, "db": repo.health()}
 
-@app.post("/forecast", response_model=ForecastResponse)
-def forecast(req: ForecastRequest):
-    # Placeholder: devolver forecast plano para MVP Day 1
-    daily = [5.0 for _ in range(req.horizon_days)]
-    return ForecastResponse(store_id=req.store_id, sku_id=req.sku_id, horizon_days=req.horizon_days, daily_forecast=daily)
+@app.post("/events/publish")
+def publish(ev: PublishIn):
+    if not ev.org_id or not ev.type:
+        raise HTTPException(400, "org_id y type son obligatorios")
+    persisted = repo.insert_event(ev.org_id, ev.type, ev.payload)
+    events.publish_redis(ev.org_id, persisted)   # best-effort (no falla si no hay Redis)
+    return {"event": persisted}
+
+@app.get("/events/poll")
+def poll(org_id: str = Query(...), after: int = 0, limit: int = 100):
+    evs = repo.list_events(org_id=org_id, after=after, limit=min(500, max(1, limit)))
+    cursor = evs[-1]["id"] if evs else after
+    return {"events": evs, "cursor": cursor}

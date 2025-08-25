@@ -1,69 +1,59 @@
+# services/slack_notify.py
+from __future__ import annotations
 import json
+from typing import Iterable, Union
 import requests
-import pandas as pd
-from datetime import datetime, timezone
 
-def _row_ts_iso(row) -> str:
-    if hasattr(row, "ts_iso") and str(row.ts_iso):
-        return str(row.ts_iso)
-    return datetime.now(timezone.utc).isoformat()
+try:
+    import pandas as pd  # para detectar DataFrame
+except Exception:
+    pd = None
 
-def send_slack_notifications(notif_df: pd.DataFrame, webhook: str) -> tuple[bool, str]:
+def _is_valid_url(u: object) -> bool:
+    return isinstance(u, str) and u.strip().startswith(("http://", "https://"))
+
+def _is_nan_like(v: object) -> bool:
+    try:
+        import math, numpy as np  # type: ignore
+        if v is None:
+            return True
+        if isinstance(v, float) and math.isnan(v):
+            return True
+        if "numpy" in globals() and isinstance(v, (np.floating,)) and np.isnan(v):
+            return True
+    except Exception:
+        pass
+    return isinstance(v, str) and v.strip().lower() == "nan"
+
+def _build_text(payload: Union[Iterable[dict], "pd.DataFrame", dict]) -> str:
+    # Mensaje muy simple; puedes personalizarlo si ya tenías formato con blocks.
+    if pd is not None and isinstance(payload, pd.DataFrame):
+        return f"Aprobados: {len(payload)} movimiento(s)."
+    if isinstance(payload, dict):
+        return f"Aprobados: {json.dumps(payload, ensure_ascii=False)[:1800]}"
+    try:
+        it = list(payload)  # Iterable[dict]
+        return f"Aprobados: {len(it)} movimiento(s)."
+    except Exception:
+        return "Aprobados: movimientos registrados."
+
+def send_slack_notifications(payload: Union[Iterable[dict], "pd.DataFrame", dict], webhook_url: object):
     """
-    Espera columnas:
-      - kind: "order" | "transfer"
-      - org_id (opcional)
-      - actor  (email/usuario)
-      - ts_iso (ISO8601 UTC) opcional; se rellena si falta
-      - Para order: store_id, sku_id, qty
-      - Para transfer: from_store, to_store, sku_id, qty
+    Envía un mensaje simple a Slack vía webhook.
+    Retorna (ok: bool, msg: str). No lanza excepciones hacia el llamador.
     """
-    if not webhook:
-        return False, "Webhook vacío."
-    if notif_df is None or notif_df.empty:
-        return False, "No hay notificaciones pendientes."
+    if _is_nan_like(webhook_url) or not _is_valid_url(webhook_url):
+        return False, "Slack: webhook inválido o vacío; no se envió notificación."
 
-    blocks = [{"type": "header", "text": {"type": "plain_text", "text": "Inventario — Movimientos aprobados"}}]
-
-    for r in notif_df.itertuples(index=False):
-        try:
-            kind = getattr(r, "kind", "unknown")
-            actor = getattr(r, "actor", "desconocido")
-            org_id = getattr(r, "org_id", "")
-            ts = _row_ts_iso(r)
-
-            if kind == "order":
-                store = r.store_id
-                sku = r.sku_id
-                qty = int(r.qty)
-                affected = f"Pedido — Sucursal *{store}*, SKU *{sku}*, Cant. *{qty}*"
-                icon = "🧾"
-            elif kind == "transfer":
-                frm = r.from_store
-                to  = r.to_store
-                sku = r.sku_id
-                qty = int(r.qty)
-                affected = f"Transferencia — *{frm}* → *{to}*, SKU *{sku}*, Cant. *{qty}*"
-                icon = "🔁"
-            else:
-                affected = json.dumps(r._asdict(), ensure_ascii=False)
-                icon = "ℹ️"
-
-            lines = [
-                f"{icon} *{kind.upper()}* {'('+org_id+')' if org_id else ''}",
-                f"{affected}",
-                f"_Aprobado por_: *{actor}*    ·    _Hora (UTC)_: `{ts}`",
-            ]
-            txt = "\n".join(lines)
-        except Exception:
-            txt = str(r)
-
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": txt}})
+    url = str(webhook_url).strip()
+    data = {"text": _build_text(payload)}
 
     try:
-        resp = requests.post(webhook, json={"blocks": blocks}, timeout=10)
-        if resp.status_code != 200:
-            return False, f"Slack respondió {resp.status_code}: {resp.text}"
-        return True, "Notificaciones enviadas a Slack."
-    except Exception as e:
-        return False, f"Error de red: {e}"
+        resp = requests.post(url, json=data, timeout=5)
+        if 200 <= resp.status_code < 300:
+            return True, "Slack: notificación enviada."
+        return False, f"Slack: respuesta {resp.status_code} {resp.text[:200]}"
+    except requests.exceptions.MissingSchema as e:
+        return False, f"Slack: URL inválida. {e}"
+    except requests.exceptions.RequestException as e:
+        return False, f"Slack: error de red. {e}"

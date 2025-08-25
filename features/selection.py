@@ -22,8 +22,11 @@ def render_selectable_editor(
     rename_func=None,
 ):
     """
-    Una sola tabla (st.data_editor) con columna checkbox integrada, scroll (~10 filas) y
-    botones seleccionar/deseleccionar todo. Devuelve selected_ids (lista de row_ids).
+    Tabla con st.data_editor + columna checkbox.
+    - IDs de negocio en __row_id__ (oculta) para mapear selección sin depender del índice.
+    - Estado persistente en st.session_state[<key>_selected_ids] (set de row_ids).
+    - Botones de selección masiva como st.form_submit_button (válidos dentro de forms).
+    - Al seleccionar/deseleccionar todo se reinicia el estado del editor para reflejar el cambio inmediatamente.
     """
     if df is None or df.empty:
         st.info("Sin datos.")
@@ -31,41 +34,73 @@ def render_selectable_editor(
 
     df = _ensure_row_ids(df, id_cols)
     sel_key = f"{key}_selected_ids"
+    editor_key = f"{key}_editor"
+
     if sel_key not in st.session_state:
         st.session_state[sel_key] = set()
 
-    show = df[display_cols].copy()
+    # Data a mostrar: columnas visibles + __row_id__ (oculta)
+    show = df[display_cols + ["__row_id__"]].copy()
     if rename_func is not None:
         show = rename_func(show)
 
-    show.insert(0, approve_label, show.index.map(lambda i: df.loc[i, "__row_id__"] in st.session_state[sel_key]))
+    # Casilla inicial basada en session_state (no pasamos 'value' al widget)
+    show.insert(0, approve_label, show["__row_id__"].map(lambda rid: rid in st.session_state[sel_key]))
 
+    # Acciones masivas dentro de forms
     c1, c2, c3 = st.columns([1, 1, 3])
-    if c1.button("Seleccionar todo", key=f"{key}_all"):
-        st.session_state[sel_key] = set(df["__row_id__"])
-        show[approve_label] = True
-    if c2.button("Deseleccionar todo", key=f"{key}_none"):
-        st.session_state[sel_key] = set()
-        show[approve_label] = False
-    c3.caption(f"{approve_label}: **{len(st.session_state[sel_key])} de {len(df)}** seleccionados")
+    select_all = c1.form_submit_button("Seleccionar todo", use_container_width=True)
+    clear_all  = c2.form_submit_button("Deseleccionar todo", use_container_width=True)
 
+    # Aplica acciones (independientes) y reinicia el estado del editor para evitar que el widget retenga checks previos
+    if clear_all:
+        st.session_state[sel_key] = set()
+        if editor_key in st.session_state:
+            del st.session_state[editor_key]
+    if select_all:
+        st.session_state[sel_key] = set(df["__row_id__"])
+        if editor_key in st.session_state:
+            del st.session_state[editor_key]
+
+    # Recalcular booleans según el estado actual tras acciones
+    show[approve_label] = show["__row_id__"].map(lambda rid: rid in st.session_state[sel_key])
+
+    # Columnas no editables (todo menos el checkbox)
     disabled_cols = [c for c in show.columns if c != approve_label]
+
+    # Configurar columnas (ocultar __row_id__ si es posible)
+    col_cfg = {
+        approve_label: st.column_config.CheckboxColumn(
+            approve_label,
+            help="Marca para aprobar esta fila"
+        ),
+    }
+    try:
+        col_cfg["__row_id__"] = st.column_config.TextColumn(
+            "__row_id__", help="row-id", disabled=True, hidden=True
+        )
+    except Exception:
+        pass
+
     edited = st.data_editor(
         show,
-        key=f"{key}_editor",
+        key=editor_key,
         num_rows="fixed",
         use_container_width=True,
         hide_index=True,
         disabled=disabled_cols,
         height=height_px,
-        column_config={
-            approve_label: st.column_config.CheckboxColumn(
-                approve_label, help="Marca para aprobar esta fila", default=False
-            ),
-        },
+        column_config=col_cfg,
     )
 
-    current_selected_idx = edited.index[edited[approve_label]].tolist()
-    selected_ids = df.loc[current_selected_idx, "__row_id__"].tolist()
+    # Determinar seleccionados del resultado editado SIN depender del índice base
+    if "__row_id__" in edited.columns:
+        selected_ids = edited.loc[edited[approve_label], "__row_id__"].tolist()
+    else:
+        current_selected_idx = edited.index[edited[approve_label]].tolist()
+        selected_ids = df.loc[current_selected_idx, "__row_id__"].tolist()
+
+    # Persistir selección y mostrar resumen abajo
     st.session_state[sel_key] = set(selected_ids)
+
     return selected_ids
