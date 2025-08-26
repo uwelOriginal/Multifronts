@@ -56,7 +56,7 @@ def main():
     (DATA_DIR, stores, skus, sales, inv, lt, promos, distances, orders_c, transfers_c, notifications) = load_data()
 
     if not (DATA_DIR / "stores.csv").exists():
-        init_all(days=180, orgs=2, seed=42)
+        init_all()
 
     st.title("🧭 MULTI FRONTS")
 
