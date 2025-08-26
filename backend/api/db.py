@@ -4,7 +4,7 @@ import datetime, os, json as _json
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
     Integer, String, DateTime, JSON, Numeric, UniqueConstraint,
-    select, and_, insert, text
+    select, and_, insert, text, Boolean
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
@@ -89,3 +89,55 @@ def poll_events(org_id: str, after: int = 0, limit: int = 200):
         evs = [{"id": int(r.id), "ts": r.ts.isoformat()+"Z", "type": r.type, "payload": r.payload} for r in rows]
         cursor = evs[-1]["id"] if evs else after
         return evs, cursor
+
+# --- Mesajería ----
+slack_installs = Table(
+    "slack_installs", meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("org_id", String(128), nullable=False, index=True, unique=True),
+    Column("team_id", String(64), nullable=False, index=True),
+    Column("bot_token", String(256), nullable=True),  # xoxb-...
+    Column("webhook_url", String(512), nullable=True),  # devuelta por scope incoming-webhook
+    Column("webhook_channel", String(128), nullable=True),
+    Column("installed_by", String(128), nullable=True),  # email/usuario opcional
+    Column("created_at", DateTime, nullable=False, default=datetime.datetime.utcnow),
+)
+
+def save_slack_install(org_id: str, team_id: str, bot_token: str | None,
+                       webhook_url: str | None, webhook_channel: str | None,
+                       installed_by: str | None = None):
+    with engine.begin() as conn:
+        # upsert simple por org_id
+        existing = conn.execute(
+            select(slack_installs.c.id).where(slack_installs.c.org_id == org_id)
+        ).first()
+        if existing:
+            conn.execute(
+                slack_installs.update()
+                .where(slack_installs.c.org_id == org_id)
+                .values(team_id=team_id, bot_token=bot_token, webhook_url=webhook_url,
+                        webhook_channel=webhook_channel, installed_by=installed_by)
+            )
+        else:
+            conn.execute(
+                slack_installs.insert().values(
+                    org_id=org_id, team_id=team_id, bot_token=bot_token,
+                    webhook_url=webhook_url, webhook_channel=webhook_channel,
+                    installed_by=installed_by
+                )
+            )
+
+def get_slack_status(org_id: str):
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(slack_installs.c.team_id, slack_installs.c.webhook_url, slack_installs.c.webhook_channel)
+            .where(slack_installs.c.org_id == org_id)
+        ).first()
+        if not row:
+            return {"connected": False}
+        return {
+            "connected": True,
+            "team_id": row.team_id,
+            "webhook_url": row.webhook_url,
+            "webhook_channel": row.webhook_channel,
+        }

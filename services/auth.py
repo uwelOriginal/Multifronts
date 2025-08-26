@@ -1,3 +1,6 @@
+# services/auth.py
+from __future__ import annotations
+
 import os
 import re
 import sys
@@ -7,6 +10,20 @@ from pathlib import Path
 import hashlib
 import pandas as pd
 import streamlit as st
+import requests
+
+from services.accounts_repo import (
+    init_accounts_db, migrate_from_csv,
+    df_users as db_df_users,
+    df_orgs as db_df_orgs,
+    df_org_store_map as db_df_org_store_map,
+    df_org_sku_map as db_df_org_sku_map,
+    get_user_by_email as db_get_user_by_email,
+    create_user as db_create_user,
+    upsert_org as db_upsert_org,
+    sync_org_maps_from_csv,   # <--- nuevo
+)
+from services.repo import current_db_info
 
 EMAIL_RX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
@@ -17,36 +34,98 @@ class User:
     role: str = "member"
     display_name: str = ""
 
-def _load_df(path: Path) -> pd.DataFrame | None:
+def _csv_path(data_dir: Path, name: str) -> Path:
+    return data_dir / "accounts" / name
+
+def _read_csv_or_empty(p: Path, cols: list[str]) -> pd.DataFrame:
     try:
-        if path.exists():
-            return pd.read_csv(path)
+        if p.exists():
+            df = pd.read_csv(p)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                for c in cols:
+                    if c not in df.columns:
+                        df[c] = pd.Series(dtype=object)
+                return df
     except Exception:
         pass
-    return None
+    return pd.DataFrame(columns=cols)
+
+def _load_from_csv(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    users = _read_csv_or_empty(_csv_path(data_dir, "users.csv"),
+                               ["id","email","password","org_id","role","display_name"])
+    orgs  = _read_csv_or_empty(_csv_path(data_dir, "orgs.csv"),
+                               ["org_id","display_name","slack_webhook"])
+    osm   = _read_csv_or_empty(_csv_path(data_dir, "org_store_map.csv"),
+                               ["org_id","store_id"])
+    osk   = _read_csv_or_empty(_csv_path(data_dir, "org_sku_map.csv"),
+                               ["org_id","sku_id"])
+    return users, orgs, osm, osk
+
+def _seed_admin_from_secrets() -> bool:
+    email = st.secrets.get("SEED_ADMIN_EMAIL") if hasattr(st, "secrets") else os.getenv("SEED_ADMIN_EMAIL")
+    pwd   = st.secrets.get("SEED_ADMIN_PASSWORD") if hasattr(st, "secrets") else os.getenv("SEED_ADMIN_PASSWORD")
+    org   = st.secrets.get("SEED_ADMIN_ORG") if hasattr(st, "secrets") else os.getenv("SEED_ADMIN_ORG")
+    if not email or not pwd:
+        return False
+    try:
+        db_upsert_org(str(org or "default"), display_name=str(org or "default"))
+        if not db_get_user_by_email(str(email).lower()):
+            db_create_user(email=str(email).lower(), password=str(pwd), org_id=str(org or "default"),
+                           role="admin", display_name=str(email).split("@")[0].title())
+        return True
+    except Exception:
+        return False
+
+def _ensure_db_seeded(data_dir: Path) -> None:
+    dialect, _, _ = current_db_info()
+    if str(dialect).lower() != "postgresql":
+        return
+    init_accounts_db()
+    du = db_df_users()
+    if du is None or du.empty:
+        try:
+            migrate_from_csv(data_dir)
+        except Exception:
+            pass
+        du2 = db_df_users()
+        if du2 is None or du2.empty:
+            _seed_admin_from_secrets()
 
 def load_account_tables(data_dir: Path):
-    acc_dir = data_dir / "accounts"
-    users = _load_df(acc_dir / "users.csv")
-    orgs  = _load_df(acc_dir / "orgs.csv")
-    org_store_map = _load_df(acc_dir / "org_store_map.csv")
-    org_sku_map   = _load_df(acc_dir / "org_sku_map.csv")
-    return users, orgs, org_store_map, org_sku_map
+    st.session_state.pop("auth_fallback", None)
+    st.session_state.pop("auth_fallback_reason", None)
 
-def try_login(email: str, password: str, users_df: pd.DataFrame | None):
-    if users_df is None or users_df.empty:
-        return None
-    row = users_df[users_df["email"].str.lower() == email.strip().lower()]
-    if row.empty:
-        return None
-    if "password" in row.columns:
-        ok = str(row["password"].iloc[0]) == str(password)
-        if not ok:
-            return None
-    org_id = str(row["org_id"].iloc[0]) if "org_id" in row.columns else "default"
-    role = str(row["role"].iloc[0]) if "role" in row.columns else "member"
-    display_name = str(row["display_name"].iloc[0]) if "display_name" in row.columns else email.strip()
-    return User(email=email.strip(), org_id=org_id, role=role, display_name=display_name)
+    try:
+        _ensure_db_seeded(data_dir)
+
+        users = db_df_users()
+        if users is None or users.empty:
+            users = pd.DataFrame(columns=["id","email","password","org_id","role","display_name"])
+
+        orgs = db_df_orgs()
+        if orgs is None or orgs.empty:
+            orgs = pd.DataFrame(columns=["org_id","display_name","slack_webhook"])
+
+        org_store_map = db_df_org_store_map()
+        if org_store_map is None or org_store_map.empty:
+            org_store_map = pd.DataFrame(columns=["org_id","store_id"])
+
+        org_sku_map = db_df_org_sku_map()
+        if org_sku_map is None or org_sku_map.empty:
+            org_sku_map = pd.DataFrame(columns=["org_id","sku_id"])
+
+        dialect, host, _ = current_db_info()
+        if str(dialect).lower() != "postgresql":
+            st.session_state["auth_fallback"] = "csv"
+            st.session_state["auth_fallback_reason"] = f"DB no-Postgres detectada ({dialect}). Revisa DATABASE_URL / secrets."
+
+        return users, orgs, org_store_map, org_sku_map
+
+    except Exception as e:
+        users, orgs, org_store_map, org_sku_map = _load_from_csv(data_dir)
+        st.session_state["auth_fallback"] = "csv"
+        st.session_state["auth_fallback_reason"] = str(e)
+        return users, orgs, org_store_map, org_sku_map
 
 def get_current_user():
     return st.session_state.get("_current_user")
@@ -57,56 +136,52 @@ def set_current_user(user):
     else:
         st.session_state["_current_user"] = user
 
-def _valid_url(u: str | None) -> bool:
-    return bool(u) and u.strip().lower().startswith(("http://", "https://"))
+def try_login(email: str, password: str, users_df: pd.DataFrame | None):
+    if not email or not EMAIL_RX.match(email.strip()):
+        return None
 
-def resolve_org_webhook(orgs_df: pd.DataFrame | None, org_id: str) -> str | None:
-    # 1) CSV de organizaciones
-    if orgs_df is not None and not orgs_df.empty and "org_id" in orgs_df.columns:
-        row = orgs_df[orgs_df["org_id"].astype(str) == str(org_id)]
-        if not row.empty and "slack_webhook" in row.columns:
-            val = str(row["slack_webhook"].iloc[0]).strip()
-            if val and val.lower() != "nan" and _valid_url(val):
-                return val
-    # 2) Secrets en Streamlit
-    try:
-        val = st.secrets.get("SLACK_WEBHOOK_URL", "")  # type: ignore[attr-defined]
-        if _valid_url(val):
-            return val.strip()
-    except Exception:
-        pass
-    # 3) Variable de entorno
-    env = os.getenv("SLACK_WEBHOOK_URL", "").strip()
-    return env if _valid_url(env) else None
+    if st.session_state.get("auth_fallback") != "csv":
+        try:
+            row = db_get_user_by_email(email.strip().lower())
+            if row:
+                if str(row["password"]) != str(password):
+                    return None
+                return User(
+                    email=row["email"],
+                    org_id=row["org_id"],
+                    role=row.get("role","member") or "member",
+                    display_name=row.get("display_name") or row["email"],
+                )
+        except Exception as e:
+            st.session_state["auth_fallback"] = "csv"
+            st.session_state["auth_fallback_reason"] = f"DB error: {e}"
 
-# ---------- Registro (sin hard-codear la clave) ----------
+    if users_df is None or users_df.empty:
+        return None
+    dfrow = users_df[users_df["email"].astype(str).str.lower() == email.strip().lower()]
+    if dfrow.empty:
+        return None
+    if "password" in dfrow.columns:
+        if str(dfrow["password"].iloc[0]) != str(password):
+            return None
+    org_id = str(dfrow["org_id"].iloc[0]) if "org_id" in dfrow.columns else "default"
+    role = str(dfrow["role"].iloc[0]) if "role" in dfrow.columns else "member"
+    display_name = str(dfrow["display_name"].iloc[0]) if "display_name" in dfrow.columns else email.strip()
+    return User(email=email.strip(), org_id=org_id, role=role, display_name=display_name)
 
-def _get_reg_secret_hash() -> str | None:
-    # Lee de st.secrets o del entorno. No hay valores por defecto.
-    # Ejemplo de configuración:
-    #   REGISTRATION_SECRET_HASH = sha256("4rribakonfront")
-    try:
-        return st.secrets.get("REGISTRATION_SECRET_HASH")  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    return os.getenv("REGISTRATION_SECRET_HASH")
-
-def _sha256_hex(s: str) -> str:
+def _hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def _validate_reg_secret(user_input: str) -> bool:
-    cfg_hash = _get_reg_secret_hash()
-    if not cfg_hash:
-        # Si no hay hash configurado, no permitimos registro (evita bypass).
+def _validate_reg_secret(reg_code: str) -> bool:
+    want = st.secrets.get("REGISTRATION_SECRET_HASH", None) if hasattr(st, "secrets") else os.getenv("REGISTRATION_SECRET_HASH")
+    if not want:
+        return True
+    if not reg_code:
         return False
-    return _sha256_hex(user_input.strip()) == cfg_hash.strip().lower()
+    return _hash(reg_code.strip()) == str(want).strip()
 
-def _run_generator_register(email: str, password: str, org_name: str, stores: int = 2, sku_fraction: float = 0.35) -> tuple[bool, str, str | None]:
-    """
-    Ejecuta generate_data.py en modo --register (o lo importa si es posible).
-    Devuelve (ok, msg, org_id).
-    """
-    # Intento 1: importar y llamar a la función (más rápido)
+def _run_generator_register(email: str, password: str, org_name: str, stores: int = 2, sku_fraction: float = 0.35):
+    # Intento 1: import directo
     try:
         import importlib
         gen = importlib.import_module("generate_data")
@@ -120,11 +195,10 @@ def _run_generator_register(email: str, password: str, org_name: str, stores: in
                 sku_fraction=sku_fraction,
             )
             return True, "Cuenta creada.", org_id
-    except Exception as e:
-        # Fallback a CLI
+    except Exception:
         pass
 
-    # Intento 2: ejecutar como subproceso CLI
+    # Intento 2: CLI
     try:
         gen_path = Path.cwd() / "generate_data.py"
         if not gen_path.exists():
@@ -141,7 +215,6 @@ def _run_generator_register(email: str, password: str, org_name: str, stores: in
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if res.returncode != 0:
             return False, f"Error al registrar: {res.stderr.strip() or res.stdout.strip()}", None
-        # El script imprime la org_id en una línea "ORG_ID=<id>"
         out = res.stdout + "\n" + res.stderr
         org_id = None
         for line in out.splitlines():
@@ -160,45 +233,81 @@ def register_ui(data_dir: Path):
         email = st.text_input("Email de acceso", placeholder="usuario@miempresa.com")
         pwd1 = st.text_input("Contraseña", type="password")
         pwd2 = st.text_input("Confirmar contraseña", type="password")
-        reg_code = st.text_input("Clave del panel", type="password", help="Solicítala a la organización. No se guarda, sólo se valida.")
+        reg_code = st.text_input("Clave del panel", type="password")
 
-        stores_n = st.number_input("Tiendas a crear", min_value=1, max_value=5, value=2, step=1, help="Se sintetizan con datos de demo.")
+        stores_n = st.number_input("Tiendas a crear", min_value=1, max_value=5, value=2, step=1)
         sku_frac = st.slider("Fracción de SKUs a asignar al catálogo", 0.1, 1.0, 0.35, 0.05)
 
         if st.button("Registrar nueva organización y cuenta", type="primary", use_container_width=True):
-            # Validaciones
             if not org_name.strip():
-                st.error("Escribe el nombre de la organización.")
-                return
+                st.error("Escribe el nombre de la organización."); return
             if not EMAIL_RX.match(email.strip()):
-                st.error("Email inválido (formato nombre@dominio.ext).")
-                return
-            if users_df is not None and not users_df[users_df["email"].str.lower() == email.strip().lower()].empty:
-                st.error("Este email ya existe. Intenta iniciar sesión.")
-                return
+                st.error("Email inválido."); return
+            if users_df is not None and not users_df.empty and not users_df[users_df["email"].astype(str).str.lower() == email.strip().lower()].empty:
+                st.error("Este email ya existe. Intenta iniciar sesión."); return
             if not pwd1 or len(pwd1) < 6:
-                st.error("La contraseña debe tener al menos 6 caracteres.")
-                return
+                st.error("La contraseña debe tener al menos 6 caracteres."); return
             if pwd1 != pwd2:
-                st.error("Las contraseñas no coinciden.")
-                return
+                st.error("Las contraseñas no coinciden."); return
             if not _validate_reg_secret(reg_code):
-                st.error("Clave del panel inválida o configuración faltante.")
-                st.info("Pide al admin que configure REGISTRATION_SECRET_HASH en secrets o variables de entorno.")
+                st.error("Clave del panel inválida o no configurada.")
                 return
 
             ok, msg, org_id = _run_generator_register(email.strip(), pwd1, org_name.strip(), int(stores_n), float(sku_frac))
             if not ok:
-                st.error(msg)
-                return
-            st.success(f"{msg} Organización: {org_id or '(desconocida)'}")
-            # Login automático
+                st.error(msg); return
+
+            # Persistir en Neon
+            errors = []
+            try:
+                db_upsert_org(org_id or "default", display_name=org_name.strip())
+            except Exception as e:
+                errors.append(f"upsert_org: {e}")
+
+            user_id = None
+            try:
+                existing = db_get_user_by_email(email.strip().lower())
+                if existing:
+                    user_id = existing.get("id")
+                else:
+                    user_id = db_create_user(
+                        email=email.strip().lower(), password=pwd1,
+                        org_id=(org_id or "default"),
+                        role="admin",
+                        display_name=email.split("@")[0].title()
+                    )
+            except Exception as e:
+                errors.append(f"create_user: {e}")
+
+            # Sync mapas para la org recién creada (idempotente)
+            added_stores = 0
+            added_skus = 0
+            try:
+                added_stores, added_skus = sync_org_maps_from_csv(org_id or "default", Path("./data"))
+            except Exception as e:
+                errors.append(f"sync_maps: {e}")
+
+            if errors:
+                st.warning("Cuenta creada, pero hubo problemas al persistir en DB:\n- " + "\n- ".join(errors))
+            else:
+                st.success(
+                    f"{msg} Org: {org_id or '(desconocida)'} | Usuario ID: {user_id or '(N/D)'} | "
+                    f"Mapas añadidos → tiendas: {added_stores}, skus: {added_skus}"
+                )
+
             set_current_user(User(email=email.strip(), org_id=org_id or "default", role="admin", display_name=email.split("@")[0].title()))
             st.rerun()
 
 def login_ui(data_dir: Path):
     users_df, orgs_df, _, _ = load_account_tables(data_dir)
     user = get_current_user()
+
+    if st.session_state.get("auth_fallback") == "csv":
+        reason = st.session_state.get("auth_fallback_reason", "")
+        with st.sidebar:
+            st.warning("⚠️ No hay conexión a la base de datos; la información no será en vivo.")
+            if reason:
+                st.caption(f"Detalle: {reason}")
 
     if user:
         with st.sidebar.expander("Cuenta", expanded=True):
@@ -211,7 +320,6 @@ def login_ui(data_dir: Path):
                 st.rerun()
         return user, orgs_df
 
-    # Si NO hay usuario, mostramos login + registro
     with st.sidebar.expander("Iniciar sesión", expanded=True):
         email = st.text_input("Email", key="login_email")
         password = st.text_input("Contraseña", type="password", key="login_pwd")
@@ -219,11 +327,38 @@ def login_ui(data_dir: Path):
             u = try_login(email, password, users_df)
             if u:
                 set_current_user(u)
-                st.toast(f"Sesión iniciada: {u.display_name or u.email}")
+                if st.session_state.get("auth_fallback") == "csv":
+                    st.toast("⚠️ No hay conexión a la base de datos; la información no será en vivo.", icon="⚠️")
                 st.rerun()
             else:
                 st.error("Credenciales inválidas.")
 
-    # Solo cuando no hay sesión activa se ofrece registro
     register_ui(data_dir)
     return None, orgs_df
+
+def _valid_url(url: str | None) -> bool:
+    return bool(url) and (url.startswith("http://") or url.startswith("https://"))
+
+def resolve_org_webhook(orgs_df: pd.DataFrame | None, org_id: str) -> str | None:
+    if orgs_df is None or orgs_df.empty:
+        return None
+    df = orgs_df[orgs_df["org_id"].astype(str) == str(org_id)]
+    if df.empty:
+        return None
+    val = df["slack_webhook"].iloc[0] if "slack_webhook" in df.columns else None
+    val = str(val).strip() if val is not None else None
+    return val if _valid_url(val) else None
+
+def resolve_org_webhook_oauth_first(orgs_df: pd.DataFrame | None, org_id: str) -> str | None:
+    try:
+        API = st.secrets.get("API_BASE", None) if hasattr(st, "secrets") else os.getenv("API_BASE")
+        if API:
+            r = requests.get(f"{API}/slack/status", params={"org_id": org_id}, timeout=5)
+            if r.ok:
+                j = r.json()
+                url = (j or {}).get("webhook_url")
+                if _valid_url(url):
+                    return url
+    except Exception:
+        pass
+    return resolve_org_webhook(orgs_df, org_id)

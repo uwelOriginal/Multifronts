@@ -1,6 +1,11 @@
+# streamlit_app.py
 import streamlit as st
 from pathlib import Path, PurePath
-import time, select, re
+import time, select, re, sys
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 # Núcleo y utilidades propias
 from core.load import load_data
@@ -26,7 +31,12 @@ try:
 except Exception:
     psycopg = None  # si no está instalado, desactivamos live updates y avisamos
 
-import re, threading, queue
+# 🔧 aliasa el módulo queue para evitar UnboundLocalError
+import re, threading
+import queue as pyqueue
+
+# Para diagnosticar la base de datos
+from services import diagnostics as dx
 
 st.set_page_config(page_title="Control de Inventario — Operación & Resumen 4.5", layout="wide")
 
@@ -44,6 +54,8 @@ def main():
 
     st.title("🧭 MULTI FRONTS")
 
+    # ---- INSERTAR DIAGNOSTICO NEON AQUI -----
+
     # Login obligatorio
     user, orgs_df = login_ui(DATA_DIR)
     actor = get_current_user()
@@ -52,7 +64,7 @@ def main():
         st.info("Inicia sesión desde el panel lateral.")
         st.stop()
 
-    st.caption(f"Sesión: **{actor.display_name or actor.email}** @ **{actor.org_id}**")
+    st.caption(f"Sesión: **{actor.display_name or actor.email}** de **{actor.org_id}**")
 
     # Scope por organización
     allowed_stores, allowed_skus = get_allowed_sets(DATA_DIR, actor.org_id)
@@ -120,7 +132,7 @@ def main():
     fpanel = FilterPanel(ctx)
     filters = fpanel.render(mode=mode, default_expand=(section == "Operación"))
 
-    # ======= Render de vistas dentro de un CONTENEDOR (para repintar sin recargar toda la página) =======
+    # ======= Render de vistas en contenedor (repinta sin recargar toda la página) =======
     dyn = st.container()
 
     def render_views_in():
@@ -147,7 +159,7 @@ def main():
             @st.cache_resource(show_spinner=False)
             def get_pg_listener(db_url: str, channel_name: str):
                 url = db_url.replace("+psycopg", "")  # psycopg no entiende el sufijo de SQLAlchemy
-                q: "queue.Queue[str]" = queue.Queue()
+                q: "pyqueue.Queue[str]" = pyqueue.Queue()
                 stop_evt = threading.Event()
 
                 def _run():
@@ -157,42 +169,45 @@ def main():
                             with conn.cursor() as cur:
                                 cur.execute(f"LISTEN {channel_name};")
                                 while not stop_evt.is_set():
-                                    # Espera activa de bajo costo en el hilo (no bloquea la UI)
-                                    if select.select([conn], [], [], 1.0)[0]:
-                                        conn.poll()
-                                        while conn.notifies:
-                                            n = conn.notifies.pop(0)
-                                            # Enviamos el payload (si lo hubiere) a la cola
-                                            q.put(n.payload or "{}")
-                    except Exception as e:
-                        # Señalizamos error en la misma cola
-                        q.put(f'__ERROR__:{e}')
+                                    if select.select([conn], [], [], 1.0) == ([], [], []):
+                                        continue
+                                    conn.poll()
+                                    while conn.notifies:
+                                        note = conn.notifies.pop(0)
+                                        try:
+                                            q.put_nowait(note.payload or "")
+                                        except Exception:
+                                            pass
+                    except Exception:
+                        # Si hay un error aquí, el queue sigue existiendo; evitamos romper la app
+                        pass
 
-                th = threading.Thread(target=_run, name="pg-notify-listener", daemon=True)
+                th = threading.Thread(target=_run, name="pg-listener", daemon=True)
                 th.start()
                 return q, stop_evt
 
-            # 2) Arrancar (o recuperar) el listener para el canal de la organización
             chan = "org_events_" + re.sub(r"[^a-zA-Z0-9_]", "_", str(ctx.org_id))
             q, stop_evt = get_pg_listener(repo.DB_URL, chan)
 
-            # 3) Drenar la cola SIN bloquear y repintar sólo el contenedor si hubo eventos
             drained = False
-            # Evita bucles largos: sólo vaciamos lo que haya ya encolado
-            for _ in range(256):  # límite razonable por tick
-                try:
-                    msg = q.get_nowait()
-                    # si quieres depurar: st.sidebar.write("notify:", msg[:120])
-                    drained = True
-                except queue.Empty:
-                    break
+            try:
+                q, stop_evt = get_pg_listener(repo.DB_URL, chan)
+            except Exception:
+                q, stop_evt = None, None
 
-            if drained:
-                # Repinta SOLO la “isla” dinámica (sin rerun)
-                dyn.empty()
-                render_views_in()
+            if q is not None:
+                drained = False
+                for _ in range(256):
+                    try:
+                        _msg = q.get_nowait()
+                        drained = True
+                    except pyqueue.Empty:
+                        break
 
-            # 4) (Opcional) botón para escuchar intensivamente durante N segundos (modo puntual)
+                if drained:
+                    dyn.empty()
+                    render_views_in()
+
             with st.sidebar.expander("Modo escucha puntual", expanded=False):
                 secs = st.number_input("Segundos", min_value=5, max_value=120, value=20, step=5)
                 if st.button("👂 Escuchar ahora"):
@@ -200,11 +215,10 @@ def main():
                     deadline = time.time() + float(secs)
                     while time.time() < deadline:
                         try:
-                            # Espera hasta 1s cada vez; repinta sólo cuando llega algo
                             msg = q.get(timeout=1.0)
                             dyn.empty()
                             render_views_in()
-                        except queue.Empty:
+                        except pyqueue.Empty:
                             pass
 
 if __name__ == "__main__":

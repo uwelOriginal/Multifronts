@@ -1,0 +1,27 @@
+# Diagnóstico de Neon, pegar en streamlit_app.py
+
+with st.sidebar.expander("🧪 Diagnóstico Neon", expanded=True):
+    st.caption("Usa esto sólo para pruebas; quítalo cuando termines.")
+    org_hint = st.text_input("Org ID a revisar (exacto)", value="konfront")
+    email_hint = st.text_input("Email para test (se creará si no existe)", value="dummy@konfront.com")
+    pwd_hint = st.text_input("Password test", value="Passw0rd!", type="password")
+
+    if st.button("1) Info de conexión"):
+        st.json(dx.neon_info())
+
+    if st.button("2) Conteos en DB"):
+        st.json(dx.counts_for_org(org_hint))
+
+    if st.button("3) Snapshot CSV"):
+        st.json(dx.csv_snapshot(org_hint))
+
+    if st.button("4) Resolver org final (por si hay sufijo)"):
+        st.json(dx.dryrun_org_id_resolved(org_name="konfront", email_used=email_hint))
+
+    if st.button("5) Probar creación de usuario"):
+        st.json(dx.test_insert_user(email_hint, pwd_hint, org_hint))
+        st.json(dx.counts_for_org(org_hint))
+
+    if st.button("6) Sincronizar org_sku_map para org"):
+        st.json(dx.try_sync_sku_map_for_org(org_hint, limit=200))
+        st.json(dx.counts_for_org(org_hint))

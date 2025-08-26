@@ -1,4 +1,4 @@
-# services/client_events.py
+# services/client_events.py (igual)
 import os, requests
 from typing import Tuple, List, Dict, Any
 
@@ -21,10 +21,6 @@ def _api_base() -> str | None:
     return None  # sin backend configurado
 
 def poll_events(org_id: str, cursor: int, timeout: float = 5.0) -> Tuple[List[Dict[str, Any]], int]:
-    """
-    Consulta eventos nuevos después de 'cursor'. Retorna (events, new_cursor).
-    Si no hay API_BASE válido, devuelve ([], cursor) sin error.
-    """
     base = _api_base()
     if not base:
         return [], cursor
@@ -43,10 +39,6 @@ def poll_events(org_id: str, cursor: int, timeout: float = 5.0) -> Tuple[List[Di
         return [], cursor
 
 def publish_event(org_id: str, type_: str, payload: dict, timeout: float = 5.0):
-    """
-    Publica un evento (útil tras aprobar pedidos/transferencias).
-    Si no hay API_BASE válido, hace no-op y responde (False, {...}).
-    """
     base = _api_base()
     if not base:
         return False, {"error": "API_BASE no configurado"}
