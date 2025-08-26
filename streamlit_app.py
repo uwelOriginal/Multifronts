@@ -7,6 +7,9 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Instanciar data csv
+from generate_data import init_all
+
 # Núcleo y utilidades propias
 from core.load import load_data
 from core.headers import nice_headers
@@ -51,6 +54,9 @@ def navbar(available_summary: bool) -> tuple[str, str]:
 def main():
     # Carga datos crudos del repositorio
     (DATA_DIR, stores, skus, sales, inv, lt, promos, distances, orders_c, transfers_c, notifications) = load_data()
+
+    if not (DATA_DIR / "stores.csv").exists():
+        init_all(days=180, orgs=2, seed=42)
 
     st.title("🧭 MULTI FRONTS")
 
