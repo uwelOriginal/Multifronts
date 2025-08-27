@@ -1,3 +1,4 @@
+# backend/api/routes_slack.py
 import json, urllib.parse, httpx, os
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import RedirectResponse, PlainTextResponse
@@ -8,6 +9,7 @@ from .slack_utils import ensure_slack_tables, get_installation, get_hq_channel, 
 SLACK_CLIENT_ID     = os.getenv("SLACK_CLIENT_ID","")
 SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET","")
 OAUTH_REDIRECT_URL  = os.getenv("OAUTH_REDIRECT_URL","")
+SLACK_API           = "https://slack.com/api"
 
 router = APIRouter()
 
@@ -74,7 +76,7 @@ def slack_oauth_redirect(code: str | None = None, state: str | None = None):
     incoming = data.get("incoming_webhook") or {}
     webhook_url = incoming.get("url")
     webhook_channel = incoming.get("channel")
-    from sqlalchemy import text
+
     with engine.begin() as conn:
         ensure_slack_tables(conn)
         conn.execute(text("""
@@ -86,7 +88,9 @@ def slack_oauth_redirect(code: str | None = None, state: str | None = None):
                   incoming_webhook_url = COALESCE(EXCLUDED.incoming_webhook_url, slack_installations.incoming_webhook_url),
                   default_channel_id = COALESCE(EXCLUDED.default_channel_id, slack_installations.default_channel_id)
         """), {"o": org_id, "t": team_id, "bt": bot_token, "wh": webhook_url, "dc": webhook_channel})
+        # fallback: crea/asegura canal HQ también
         ensure_hq_channel(conn, org_id)
+
     if return_url:
         u = urllib.parse.urlparse(return_url)
         q = urllib.parse.parse_qs(u.query)
@@ -108,3 +112,43 @@ def debug_dbinfo():
         ver = conn.execute(text("SELECT version()")).scalar_one()
         orgs = conn.execute(text("SELECT COUNT(*) FROM orgs")).scalar_one()
     return {"db_url": masked, "db_has_orgs": orgs, "pg_version": ver}
+
+# ===== NUEVOS endpoints de diagnóstico/forzado =====
+
+@router.get("/debug/slack/check")
+def slack_check():
+    """Valida que SLACK_HQ_BOT_TOKEN existe y es válido contra auth.test."""
+    token = os.getenv("SLACK_HQ_BOT_TOKEN", "").strip()
+    has_token = bool(token and token.startswith("xoxb-"))
+    auth_ok = False
+    team = None
+    bot_user_id = None
+    error = None
+    if has_token:
+        try:
+            with httpx.Client(timeout=6.0) as client:
+                r = client.post(f"{SLACK_API}/auth.test",
+                                headers={"Authorization": f"Bearer {token}"})
+                jd = r.json()
+                auth_ok = bool(jd.get("ok"))
+                team = jd.get("team_id") or jd.get("team")
+                bot_user_id = jd.get("user_id") or jd.get("bot_id")
+                if not auth_ok:
+                    error = jd.get("error")
+        except Exception as e:
+            error = str(e)
+    return {
+        "has_token": has_token,
+        "auth_ok": auth_ok,
+        "team": team,
+        "bot_user_id": bot_user_id,
+        "error": error,
+    }
+
+@router.post("/admin/slack/ensure")
+def slack_ensure(org_id: str):
+    """Fuerza la creación/aseguramiento del canal #mf-{org_id} y lo persiste en slack_channels."""
+    with engine.begin() as conn:
+        ensure_slack_tables(conn)
+        cid = ensure_hq_channel(conn, org_id)
+        return {"ok": bool(cid), "channel_id": cid}
