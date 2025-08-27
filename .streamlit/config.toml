@@ -7,3 +7,7 @@ port = 8501
 
 [browser]
 gatherUsageStats = false
+
+[theme]
+base="dark"
+primaryColor="#7420b4ff"

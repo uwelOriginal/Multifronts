@@ -1,25 +1,32 @@
+# views/operation.py
 from __future__ import annotations
-import streamlit as st
+import time
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
+import streamlit as st
+
 from core.context import AppContext, FilterState
 from views.base import BaseView
 from utils.labels import attach_store_label
 from core.headers import nice_headers
 
-# Dominio / servicios ya existentes
+# Dominio / servicios
 from features.risk import risk_table
 from inventory import enrich_with_rop, suggest_order_for_row
 from features.selection import render_selectable_editor, selection_to_dataframe
 from services.exec_summary import gen_exec_summary_text
 from services.slack_notify import send_slack_notifications
-from services.auth import load_account_tables, resolve_org_webhook
-from services.guardrails import enforce_orders_scope, enforce_transfers_scope, filter_distances_to_scope
+from services.auth import load_account_tables, resolve_org_webhook_oauth_first
+from services.guardrails import (
+    enforce_orders_scope, enforce_transfers_scope, filter_distances_to_scope
+)
 from optimizer import suggest_transfers
-# --- Cambios: reemplazamos persistencia CSV por BD ---
+
+# Persistencia BD y eventos
 from services import repo
-import time
-from datetime import datetime, timezone
+from services.client_events import publish_event
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -72,7 +79,6 @@ class OperationView(BaseView):
             return
         orders_disp = attach_store_label(orders, self.ctx.stores, label_col="Sucursal")
 
-        # ⬇️ Formulario: evitar rerun por cada clic en casillas
         with st.form("orders_form"):
             selected_order_ids = render_selectable_editor(
                 df=orders_disp,
@@ -93,7 +99,6 @@ class OperationView(BaseView):
                 st.info("No quedó ningún pedido seleccionado.")
                 return
 
-            # Preparación para BD
             out = chosen.rename(columns={"suggested_order_qty": "qty"})
             out_valid, out_block = enforce_orders_scope(out, self.ctx.allowed_stores, self.ctx.allowed_skus)
             if not out_block.empty:
@@ -102,13 +107,11 @@ class OperationView(BaseView):
                 st.info("No quedó ningún pedido válido para aprobar.")
                 return
 
-            # Datos para notificación (con metadatos)
             out_valid = out_valid.copy()
             out_valid["org_id"] = self.ctx.org_id
             out_valid["actor"] = self.ctx.actor_email
             out_valid["ts_iso"] = _now_utc_iso()
 
-            # Persistencia en BD (idempotente)
             rows_db = out_valid[["store_id", "sku_id", "qty"]].to_dict(orient="records")
             idem_prefix = f"{self.ctx.org_id}:{self.ctx.actor_email}:{int(time.time())}"
             nuevos, duplicados = repo.save_orders(
@@ -118,15 +121,35 @@ class OperationView(BaseView):
                 idem_prefix=idem_prefix,
             )
 
-            # Slack (si hay webhook configurado)
             notif_now = out_valid.copy()
             notif_now.insert(0, "kind", "order")
-            webhook = resolve_org_webhook(load_account_tables(self.ctx.DATA_DIR)[1], self.ctx.org_id)
+
+            # Slack: primero intenta OAuth en backend, luego secrets locales
+            webhook = resolve_org_webhook_oauth_first(
+                load_account_tables(self.ctx.DATA_DIR)[1],  # accounts_df
+                self.ctx.org_id
+            )
             if webhook:
                 ok, msg = send_slack_notifications(notif_now, webhook)
                 st.toast(msg, icon="✅" if ok else "⚠️")
             else:
                 st.toast("No hay Slack webhook configurado (org o env).", icon="⚠️")
+
+            # Evento al backend (Render)
+            try:
+                publish_event(
+                    org_id=self.ctx.org_id,
+                    type_="orders_approved",
+                    payload={
+                        "approved_by": self.ctx.actor_email,
+                        "count_new": int(nuevos),
+                        "count_dup": int(duplicados),
+                        "rows": rows_db,
+                    },
+                    timeout=3.0,
+                )
+            except Exception as e:
+                st.warning(f"No se pudo publicar evento en backend: {e}")
 
             st.session_state["movements_this_session"] = True
             st.success(f"Órdenes guardadas en BD: {nuevos} nuevas, {duplicados} duplicadas (omitidas).")
@@ -149,7 +172,6 @@ class OperationView(BaseView):
         transfers_disp["De"] = transfers_disp["from_store"].map(self.ctx.id_to_label)
         transfers_disp["A"]  = transfers_disp["to_store"].map(self.ctx.id_to_label)
 
-        # ⬇️ Formulario: evitar rerun por cada clic en casillas
         with st.form("transfers_form"):
             selected_transfer_ids = render_selectable_editor(
                 df=transfers_disp,
@@ -175,34 +197,51 @@ class OperationView(BaseView):
                 st.info("No quedó ninguna transferencia válida para aprobar.")
                 return
 
-            # Datos para notificación (con metadatos)
             out_t = valid_t.copy()
             out_t["org_id"] = self.ctx.org_id
             out_t["actor"] = self.ctx.actor_email
             out_t["ts_iso"] = _now_utc_iso()
 
-            # Persistencia en BD (idempotente)
             rows_db_t = out_t[["from_store", "to_store", "sku_id", "qty"]].to_dict(orient="records")
             idem_prefix = f"{self.ctx.org_id}:{self.ctx.actor_email}:{int(time.time())}"
-            nuevos, duplicados = repo.save_transfers(
+            aplicadas, duplicadas, insuficientes = repo.save_transfers(
                 org_id=self.ctx.org_id,
                 rows=rows_db_t,
                 approved_by=self.ctx.actor_email,
                 idem_prefix=idem_prefix,
             )
 
-            # Slack (si hay webhook configurado)
             notif_now = out_t.copy()
             notif_now.insert(0, "kind", "transfer")
-            webhook = resolve_org_webhook(load_account_tables(self.ctx.DATA_DIR)[1], self.ctx.org_id)
+
+            webhook = resolve_org_webhook_oauth_first(
+                load_account_tables(self.ctx.DATA_DIR)[1],
+                self.ctx.org_id
+            )
             if webhook:
                 ok, msg = send_slack_notifications(notif_now, webhook)
                 st.toast(msg, icon="✅" if ok else "⚠️")
             else:
                 st.toast("No hay Slack webhook configurado (org o env).", icon="⚠️")
 
+            try:
+                publish_event(
+                    org_id=self.ctx.org_id,
+                    type_="transfers_approved",
+                    payload={
+                        "approved_by": self.ctx.actor_email,
+                        "count_applied": int(aplicadas),
+                        "count_dup": int(duplicadas),
+                        "count_insufficient": int(insuficientes),
+                        "rows": rows_db_t,
+                    },
+                    timeout=3.0,
+                )
+            except Exception as e:
+                st.warning(f"No se pudo publicar evento en backend: {e}")
+
             st.session_state["movements_this_session"] = True
-            st.success(f"Transferencias guardadas en BD: {nuevos} nuevas, {duplicados} duplicadas (omitidas).")
+            st.success(f"Transferencias aplicadas: {aplicadas} | duplicadas: {duplicadas} | sin stock: {insuficientes}")
 
     def _detail(self, enriched: pd.DataFrame):
         if self.mode != "Técnico":
@@ -248,8 +287,7 @@ class OperationView(BaseView):
                 st.latex(order["latex"]["values"])
 
     def render(self):
-        
-        # 1) Filtrado sobre el modelo
+        # 1) Filtros
         from ui.filters import FilterPanel
         fp = FilterPanel(self.ctx)
         sales_f, inv_f, lt_f, allowed_skus_after_filter = fp.apply_to(
@@ -263,11 +301,26 @@ class OperationView(BaseView):
             st.warning("⚠️ No hay SKUs después de aplicar filtros de categoría/ABC.")
             return
 
-        # 2) Métrica base y políticas
+        # 2) Sustituir inventario por estado vivo en BD si existe (menor latencia + consistencia)
+        try:
+            db_inv = repo.fetch_inventory_levels(
+                org_id=self.ctx.org_id,
+                store_ids=list(self.ctx.allowed_stores),
+                sku_ids=list(allowed_skus_after_filter)
+            )
+            if not db_inv.empty:
+                inv_f = inv_f.drop(columns=["on_hand_units"], errors="ignore").merge(
+                    db_inv, on=["store_id", "sku_id"], how="left"
+                )
+                inv_f["on_hand_units"] = inv_f["on_hand_units"].fillna(0)
+        except Exception as e:
+            st.info(f"(info) Inventario vivo no disponible: {e}")
+
+        # 3) Métrica base y ROP/S
         base = risk_table(sales_f, inv_f, lt_f)
         enriched = enrich_with_rop(base, service_level=self.f.service_level, order_up_factor=self.f.order_up_factor)
 
-        # 3) Secciones
+        # 4) Secciones
         self._risks_by_store(enriched)
         self._top_risks(enriched)
 

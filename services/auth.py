@@ -10,6 +10,11 @@ from pathlib import Path
 import hashlib
 import pandas as pd
 import streamlit as st
+from typing import Optional
+try:
+    import streamlit as st
+except Exception:
+    st = None
 import requests
 
 from services.accounts_repo import (
@@ -24,6 +29,7 @@ from services.accounts_repo import (
     sync_org_maps_from_csv,   # <--- nuevo
 )
 from services.repo import current_db_info
+from services.client_events import publish_event 
 
 EMAIL_RX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
@@ -294,6 +300,16 @@ def register_ui(data_dir: Path):
                     f"{msg} Org: {org_id or '(desconocida)'} | Usuario ID: {user_id or '(N/D)'} | "
                     f"Mapas añadidos → tiendas: {added_stores}, skus: {added_skus}"
                 )
+            
+            try:
+                publish_event(
+                    org_id=(org_id or "default"),
+                    type_="org_created",
+                    payload={"created_by": email.strip().lower()},
+                    timeout=3.0,
+                )
+            except Exception:
+                pass
 
             set_current_user(User(email=email.strip(), org_id=org_id or "default", role="admin", display_name=email.split("@")[0].title()))
             st.rerun()
@@ -336,8 +352,20 @@ def login_ui(data_dir: Path):
     register_ui(data_dir)
     return None, orgs_df
 
+def _api_base() -> Optional[str]:
+    """Obtiene API_BASE de secrets o env, sin la barra final."""
+    try:
+        if hasattr(st, "secrets"):
+            b = st.secrets.get("API_BASE", None)
+            if b:
+                return str(b).rstrip("/")
+    except Exception:
+        pass
+    env_b = os.getenv("API_BASE", "").strip()
+    return env_b.rstrip("/") if env_b else None
+
 def _valid_url(url: str | None) -> bool:
-    return bool(url) and (url.startswith("http://") or url.startswith("https://"))
+    return bool(url) and (str(url).startswith("http://") or str(url).startswith("https://"))
 
 def resolve_org_webhook(orgs_df: pd.DataFrame | None, org_id: str) -> str | None:
     if orgs_df is None or orgs_df.empty:
@@ -349,16 +377,42 @@ def resolve_org_webhook(orgs_df: pd.DataFrame | None, org_id: str) -> str | None
     val = str(val).strip() if val is not None else None
     return val if _valid_url(val) else None
 
-def resolve_org_webhook_oauth_first(orgs_df: pd.DataFrame | None, org_id: str) -> str | None:
-    try:
-        API = st.secrets.get("API_BASE", None) if hasattr(st, "secrets") else os.getenv("API_BASE")
-        if API:
-            r = requests.get(f"{API}/slack/status", params={"org_id": org_id}, timeout=5)
+def resolve_org_webhook_oauth_first(orgs_df: pd.DataFrame | None, org_id: str) -> Optional[str]:
+    """
+    Orden de resolución:
+      1) Backend (Render) vía OAuth: GET {API_BASE}/slack/status?org_id=...
+         Acepta llaves: 'webhook', 'incoming_webhook_url', 'webhook_url', 'url'
+      2) Secret global: SLACK_WEBHOOK_URL
+      3) Mapeo local en orgs_df (columna 'slack_webhook')
+    """
+    # 1) Backend OAuth (preferido)
+    base = _api_base()
+    if base:
+        try:
+            r = requests.get(f"{base}/slack/status", params={"org_id": org_id}, timeout=3.0)
             if r.ok:
-                j = r.json()
-                url = (j or {}).get("webhook_url")
-                if _valid_url(url):
-                    return url
+                data = r.json() or {}
+                candidates = [
+                    data.get("webhook"),
+                    data.get("incoming_webhook_url"),
+                    data.get("webhook_url"),
+                    data.get("url"),
+                ]
+                for url in candidates:
+                    if _valid_url(url):
+                        return str(url)
+        except Exception:
+            # No rompemos el flujo si el backend está caído o sin CORS
+            pass
+
+    # 2) Secret global
+    try:
+        if hasattr(st, "secrets"):
+            wh = st.secrets.get("SLACK_WEBHOOK_URL", None)
+            if _valid_url(wh):
+                return str(wh)
     except Exception:
         pass
+
+    # 3) Mapeo en orgs_df (CSV/DB)
     return resolve_org_webhook(orgs_df, org_id)

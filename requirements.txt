@@ -12,3 +12,4 @@ psycopg[binary]
 redis
 python-dotenv
 httpx
+httpx psycopg[binary]

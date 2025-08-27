@@ -1,27 +1,123 @@
-# Diagnóstico de Neon, pegar en streamlit_app.py
+# 🧪 Diagnóstico Neon & Slack, pegar en streamlit_app.py
 
-with st.sidebar.expander("🧪 Diagnóstico Neon", expanded=True):
-    st.caption("Usa esto sólo para pruebas; quítalo cuando termines.")
-    org_hint = st.text_input("Org ID a revisar (exacto)", value="konfront")
-    email_hint = st.text_input("Email para test (se creará si no existe)", value="dummy@konfront.com")
-    pwd_hint = st.text_input("Password test", value="Passw0rd!", type="password")
+with st.sidebar.expander("🧪 Diagnóstico Neon & Slack", expanded=True):
+    import os, time, json
+    import pandas as pd
+    import requests
+    from sqlalchemy import text
+    from services.repo import engine, current_db_info
+    from services.client_events import publish_event
 
-    if st.button("1) Info de conexión"):
-        st.json(dx.neon_info())
+    # -------- Inputs --------
+    c1, c2 = st.columns(2)
+    org_hint = c1.text_input("Org ID a revisar", value=getattr(st.session_state, "org_id", "alpha"))
+    email_hint = c2.text_input("Email actor (para pruebas)", value=getattr(st.session_state, "actor_email", "tester@example.com"))
+    API_BASE = (st.secrets.get("API_BASE", os.getenv("API_BASE", "")) or "").rstrip("/")
 
-    if st.button("2) Conteos en DB"):
-        st.json(dx.counts_for_org(org_hint))
+    st.caption(f"API_BASE: {API_BASE or '❌ no definido'}")
 
-    if st.button("3) Snapshot CSV"):
-        st.json(dx.csv_snapshot(org_hint))
+    # -------- Helpers --------
+    def _ok(x): return "✅" if x else "❌"
+    def _req(method, path, **kw):
+        if not API_BASE:
+            return False, {"error": "API_BASE no definido"}
+        url = f"{API_BASE}{path}"
+        try:
+            r = requests.request(method, url, timeout=6, **kw)
+            return True, (r.json() if "application/json" in r.headers.get("Content-Type", "") else {"status": r.status_code, "text": r.text})
+        except Exception as e:
+            return False, {"error": str(e)}
 
-    if st.button("4) Resolver org final (por si hay sufijo)"):
-        st.json(dx.dryrun_org_id_resolved(org_name="konfront", email_used=email_hint))
+    def _sql_all(sql, params=None):
+        with engine.begin() as conn:
+            res = conn.execute(text(sql), params or {})
+            rows = res.mappings().all()   # dict-like
+            return [dict(r) for r in rows]
 
-    if st.button("5) Probar creación de usuario"):
-        st.json(dx.test_insert_user(email_hint, pwd_hint, org_hint))
-        st.json(dx.counts_for_org(org_hint))
+    def _sql_one(sql, params=None):
+        with engine.begin() as conn:
+            res = conn.execute(text(sql), params or {})
+            row = res.mappings().first()
+            return dict(row) if row else None
 
-    if st.button("6) Sincronizar org_sku_map para org"):
-        st.json(dx.try_sync_sku_map_for_org(org_hint, limit=200))
-        st.json(dx.counts_for_org(org_hint))
+    # -------- Botones --------
+    if st.button("1) Info API/DB"):
+        dialect, host, url_masked = current_db_info()
+        st.json({"db_dialect": dialect, "db_host": host, "db_url": url_masked, "api_base": API_BASE or None})
+        ok, res = _req("GET", "/health")
+        st.write("Backend /health:", _ok(ok and res.get("ok") is True))
+        st.json(res)
+
+    if st.button("2) Conteos por organización"):
+        sql = """
+        SELECT
+        (SELECT COUNT(*) FROM orgs WHERE org_id=:o)                        AS orgs,
+        (SELECT COUNT(*) FROM users WHERE org_id=:o)                       AS users,
+        (SELECT COUNT(*) FROM org_store_map WHERE org_id=:o)               AS org_store_map,
+        (SELECT COUNT(*) FROM org_sku_map WHERE org_id=:o)                 AS org_sku_map,
+        (SELECT COUNT(*) FROM events WHERE org_id=:o)                      AS events,
+        (SELECT COUNT(*) FROM slack_installations WHERE org_id=:o)         AS slack_installations,
+        (SELECT COUNT(*) FROM slack_channels WHERE org_id=:o)              AS slack_channels,
+        (SELECT COUNT(*) FROM inventory_levels WHERE org_id=:o)            AS inventory_levels,
+        (SELECT COUNT(*) FROM orders_confirmed WHERE org_id=:o)            AS orders_confirmed,
+        (SELECT COUNT(*) FROM transfers_confirmed WHERE org_id=:o)         AS transfers_confirmed
+        """
+        st.json(_sql_one(sql, {"o": org_hint}))
+
+    c3, c4 = st.columns(2)
+    if c3.button("3) Ver slack_installations (org)"):
+        rows = _sql_all("SELECT * FROM slack_installations WHERE org_id=:o", {"o": org_hint})
+        st.write("slack_installations:", rows if rows else "(vacío)")
+    if c4.button("4) Ver slack_channels (org)"):
+        rows = _sql_all("SELECT * FROM slack_channels WHERE org_id=:o", {"o": org_hint})
+        st.write("slack_channels:", rows if rows else "(vacío)")
+
+    if st.button("5) Disparar org_created (crea/asegura canal de la org)"):
+        try:
+            publish_event(org_id=org_hint, type_="org_created", payload={"created_by": email_hint}, timeout=4.0)
+            st.success("Evento org_created publicado.")
+        except Exception as e:
+            st.error(f"No se pudo publicar evento: {e}")
+
+        # Leer estado desde backend y DB
+        ok, res = _req("GET", "/slack/status", params={"org_id": org_hint})
+        st.write("Backend /slack/status:", _ok(ok))
+        st.json(res)
+        rows = _sql_all("SELECT * FROM slack_channels WHERE org_id=:o", {"o": org_hint})
+        st.write("slack_channels (post-org_created):", rows if rows else "(vacío)")
+
+    c5, c6 = st.columns(2)
+    if c5.button("6) Reconciliar TODOS los canales (backend)"):
+        ok, res = _req("POST", "/admin/slack/reconcile")
+        st.write("POST /admin/slack/reconcile:", _ok(ok))
+        st.json(res)
+        rows = _sql_all("SELECT * FROM slack_channels WHERE org_id=:o", {"o": org_hint})
+        st.write("slack_channels (post-reconcile):", rows if rows else "(vacío)")
+
+    if c6.button("7) Probar /slack/status (org)"):
+        ok, res = _req("GET", "/slack/status", params={"org_id": org_hint})
+        st.write("Backend /slack/status:", _ok(ok))
+        st.json(res)
+
+    c7, c8 = st.columns(2)
+    if c7.button("8) Simular orders_approved"):
+        payload = {"approved_by": email_hint, "count_new": 2, "count_dup": 0, "rows": [{"store_id":"S01","sku_id":"SKU001","qty":5}]}
+        try:
+            publish_event(org_id=org_hint, type_="orders_approved", payload=payload, timeout=4.0)
+            st.success("orders_approved publicado (revisa Slack).")
+        except Exception as e:
+            st.error(f"Error publicando evento: {e}")
+
+    if c8.button("9) Simular transfers_approved"):
+        payload = {"approved_by": email_hint, "count_applied": 1, "count_dup": 0, "count_insufficient": 0,
+                "rows": [{"from_store":"S01","to_store":"S02","sku_id":"SKU001","qty":3}]}
+        try:
+            publish_event(org_id=org_hint, type_="transfers_approved", payload=payload, timeout=4.0)
+            st.success("transfers_approved publicado (revisa Slack).")
+        except Exception as e:
+            st.error(f"Error publicando evento: {e}")
+
+    if st.button("10) Últimos eventos del backend (org)"):
+        ok, res = _req("GET", "/events/poll", params={"org_id": org_hint, "after": 0, "limit": 50})
+        st.write("Backend /events/poll:", _ok(ok))
+        st.json(res)
