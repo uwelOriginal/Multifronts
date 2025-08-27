@@ -26,7 +26,7 @@ from services.accounts_repo import (
     get_user_by_email as db_get_user_by_email,
     create_user as db_create_user,
     upsert_org as db_upsert_org,
-    sync_org_maps_from_csv,   # <--- nuevo
+    sync_org_maps_from_csv,   # <--- se mantiene
 )
 from services.repo import current_db_info
 from services.client_events import publish_event 
@@ -178,13 +178,10 @@ def try_login(email: str, password: str, users_df: pd.DataFrame | None):
 def _hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def _validate_reg_secret(reg_code: str) -> bool:
-    want = st.secrets.get("REGISTRATION_SECRET_HASH", None) if hasattr(st, "secrets") else os.getenv("REGISTRATION_SECRET_HASH")
-    if not want:
-        return True
-    if not reg_code:
-        return False
-    return _hash(reg_code.strip()) == str(want).strip()
+def _validate_reg_secret(secret: str) -> bool:
+    cfg = (st.secrets.get("app", {}).get("registration_key") if hasattr(st, "secrets") else None) \
+          or os.getenv("REGISTRATION_KEY", "")
+    return bool(cfg) and (secret or "").strip() == cfg.strip()
 
 def _run_generator_register(email: str, password: str, org_name: str, stores: int = 2, sku_fraction: float = 0.35):
     # Intento 1: import directo
@@ -231,88 +228,112 @@ def _run_generator_register(email: str, password: str, org_name: str, stores: in
     except Exception as e:
         return False, f"Error al ejecutar generate_data.py: {e}", None
 
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
+
 def register_ui(data_dir: Path):
+    """
+    Registro en formulario (no re-ejecuta en cada tecla).
+    Mantiene el flujo original: generate_data -> upsert org -> create user -> sync maps -> publish_event -> set session -> rerun
+    """
     users_df, _, _, _ = load_account_tables(data_dir)
 
     with st.sidebar.expander("Crear cuenta", expanded=False):
-        org_name = st.text_input("Nombre de la organización", placeholder="Mi Retail, S.A.")
-        email = st.text_input("Email de acceso", placeholder="usuario@miempresa.com")
-        pwd1 = st.text_input("Contraseña", type="password")
-        pwd2 = st.text_input("Confirmar contraseña", type="password")
-        reg_code = st.text_input("Clave del panel", type="password")
+        # ---- FORM: sólo actúa al pulsar el botón ----
+        with st.form("register_form", clear_on_submit=False):
+            org_name = st.text_input("Nombre de la organización", placeholder="Mi Retail, S.A.", key="reg_org_name")
+            email    = st.text_input("Email de acceso", placeholder="usuario@miempresa.com", key="reg_email")
+            pwd1     = st.text_input("Contraseña", type="password", key="reg_pwd1")
+            pwd2     = st.text_input("Confirmar contraseña", type="password", key="reg_pwd2")
+            reg_code = st.text_input("Clave del panel", type="password", key="reg_code")
 
-        stores_n = st.number_input("Tiendas a crear", min_value=1, max_value=5, value=2, step=1)
-        sku_frac = st.slider("Fracción de SKUs a asignar al catálogo", 0.1, 1.0, 0.35, 0.05)
+            c1, c2 = st.columns(2)
+            stores_n = c1.number_input("Tiendas a crear", min_value=1, max_value=5, value=2, step=1, key="reg_stores")
+            sku_frac = c2.slider("Fracción de SKUs a asignar al catálogo", 0.1, 1.0, 0.35, 0.05, key="reg_sku_frac")
 
-        if st.button("Registrar nueva organización y cuenta", type="primary", use_container_width=True):
-            if not org_name.strip():
-                st.error("Escribe el nombre de la organización."); return
-            if not EMAIL_RX.match(email.strip()):
-                st.error("Email inválido."); return
-            if users_df is not None and not users_df.empty and not users_df[users_df["email"].astype(str).str.lower() == email.strip().lower()].empty:
-                st.error("Este email ya existe. Intenta iniciar sesión."); return
-            if not pwd1 or len(pwd1) < 6:
-                st.error("La contraseña debe tener al menos 6 caracteres."); return
-            if pwd1 != pwd2:
-                st.error("Las contraseñas no coinciden."); return
-            if not _validate_reg_secret(reg_code):
-                st.error("Clave del panel inválida o no configurada.")
-                return
+            submit = st.form_submit_button("Registrar nueva organización y cuenta", type="primary", use_container_width=True)
 
-            ok, msg, org_id = _run_generator_register(email.strip(), pwd1, org_name.strip(), int(stores_n), float(sku_frac))
-            if not ok:
-                st.error(msg); return
+        if not submit:
+            return  # no ejecutar nada hasta que se presione el botón
 
-            # Persistir en Neon
-            errors = []
-            try:
-                db_upsert_org(org_id or "default", display_name=org_name.strip())
-            except Exception as e:
-                errors.append(f"upsert_org: {e}")
+        # ---- Validaciones (idénticas al flujo previo) ----
+        if not org_name.strip():
+            st.error("Escribe el nombre de la organización."); return
+        if not EMAIL_RX.match(email.strip()):
+            st.error("Email inválido."); return
+        if users_df is not None and not users_df.empty and not users_df[users_df["email"].astype(str).str.lower() == email.strip().lower()].empty:
+            st.error("Este email ya existe. Intenta iniciar sesión."); return
+        if not pwd1 or len(pwd1) < 6:
+            st.error("La contraseña debe tener al menos 6 caracteres."); return
+        if pwd1 != pwd2:
+            st.error("Las contraseñas no coinciden."); return
+        if not _validate_reg_secret(reg_code):
+            st.error("Clave del panel inválida o no configurada.")
+            return
 
-            user_id = None
-            try:
-                existing = db_get_user_by_email(email.strip().lower())
-                if existing:
-                    user_id = existing.get("id")
-                else:
-                    user_id = db_create_user(
-                        email=email.strip().lower(), password=pwd1,
-                        org_id=(org_id or "default"),
-                        role="admin",
-                        display_name=email.split("@")[0].title()
-                    )
-            except Exception as e:
-                errors.append(f"create_user: {e}")
+        # ---- Generar datos base (generate_data) ----
+        ok, msg, org_id = _run_generator_register(email.strip(), pwd1, org_name.strip(), int(stores_n), float(sku_frac))
+        if not ok:
+            st.error(msg); return
 
-            # Sync mapas para la org recién creada (idempotente)
-            added_stores = 0
-            added_skus = 0
-            try:
-                added_stores, added_skus = sync_org_maps_from_csv(org_id or "default", Path("./data"))
-            except Exception as e:
-                errors.append(f"sync_maps: {e}")
+        # ---- Persistir en Neon ----
+        errors = []
+        try:
+            db_upsert_org(org_id or "default", display_name=org_name.strip())
+        except Exception as e:
+            errors.append(f"upsert_org: {e}")
 
-            if errors:
-                st.warning("Cuenta creada, pero hubo problemas al persistir en DB:\n- " + "\n- ".join(errors))
+        user_id = None
+        try:
+            existing = db_get_user_by_email(email.strip().lower())
+            if existing:
+                user_id = existing.get("id")
             else:
-                st.success(
-                    f"{msg} Org: {org_id or '(desconocida)'} | Usuario ID: {user_id or '(N/D)'} | "
-                    f"Mapas añadidos → tiendas: {added_stores}, skus: {added_skus}"
-                )
-            
-            try:
-                publish_event(
+                user_id = db_create_user(
+                    email=email.strip().lower(), password=pwd1,
                     org_id=(org_id or "default"),
-                    type_="org_created",
-                    payload={"created_by": email.strip().lower()},
-                    timeout=3.0,
+                    role="admin",
+                    display_name=email.split("@")[0].title()
                 )
-            except Exception:
-                pass
+        except Exception as e:
+            errors.append(f"create_user: {e}")
 
-            set_current_user(User(email=email.strip(), org_id=org_id or "default", role="admin", display_name=email.split("@")[0].title()))
-            st.rerun()
+        # ---- Sync mapas para la org recién creada (idempotente) ----
+        added_stores = 0
+        added_skus = 0
+        try:
+            added_stores, added_skus = sync_org_maps_from_csv(org_id or "default", Path("./data"))
+        except Exception as e:
+            errors.append(f"sync_maps: {e}")
+
+        if errors:
+            st.warning("Cuenta creada, pero hubo problemas al persistir en DB:\n- " + "\n- ".join(errors))
+        else:
+            st.success(
+                f"{msg} Org: {org_id or '(desconocida)'} | Usuario ID: {user_id or '(N/D)'} | "
+                f"Mapas añadidos → tiendas: {added_stores}, skus: {added_skus}"
+            )
+        
+        # ---- Emitir evento (se mantiene) ----
+        try:
+            publish_event(
+                org_id=(org_id or "default"),
+                type_="org_created",
+                payload={"created_by": email.strip().lower()},
+                timeout=3.0,
+            )
+        except Exception:
+            pass
+
+        # ---- Abrir sesión y rerun ----
+        set_current_user(User(email=email.strip(), org_id=org_id or "default", role="admin", display_name=email.split("@")[0].title()))
+        st.rerun()
 
 def login_ui(data_dir: Path):
     users_df, orgs_df, _, _ = load_account_tables(data_dir)
@@ -336,21 +357,22 @@ def login_ui(data_dir: Path):
                 st.rerun()
         return user, orgs_df
 
-    with st.sidebar.expander("Iniciar sesión", expanded=True):
+    # --- FORM de login: evita reruns por tecla ---
+    with st.sidebar.form("login_form", clear_on_submit=False):
         email = st.text_input("Email", key="login_email")
-        password = st.text_input("Contraseña", type="password", key="login_pwd")
-        if st.button("Entrar", type="primary", use_container_width=True):
-            u = try_login(email, password, users_df)
-            if u:
-                set_current_user(u)
-                if st.session_state.get("auth_fallback") == "csv":
-                    st.toast("⚠️ No hay conexión a la base de datos; la información no será en vivo.", icon="⚠️")
-                st.rerun()
-            else:
-                st.error("Credenciales inválidas.")
+        password = st.text_input("Contraseña", type="password", key="login_password")
+        submitted = st.form_submit_button("Entrar", use_container_width=True)
 
-    register_ui(data_dir)
-    return None, orgs_df
+    if not submitted:
+        return None, orgs_df
+
+    u = try_login(email, password, users_df)
+    if not u:
+        st.sidebar.error("Credenciales inválidas.")
+        return None, orgs_df
+
+    set_current_user(u)
+    _safe_rerun()
 
 def _api_base() -> Optional[str]:
     """Obtiene API_BASE de secrets o env, sin la barra final."""

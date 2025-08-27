@@ -54,31 +54,53 @@ def latex_explanations(mu_lt, sigma_lt, z, rop, S, order_up_factor):
     return latex
 
 def enrich_with_rop(df: pd.DataFrame, service_level: float = 0.95, order_up_factor: float = 1.0) -> pd.DataFrame:
-    if df.empty:
+    if df is None or df.empty:
         out = df.copy()
         for c in ["ROP","S_level","suggested_order_qty","order_explanation","RDP"]:
             out[c] = []
         return out
 
-    def _row_calc(r):
-        rop, S, mu_lt, sigma_lt, z = compute_rop_s(
-            r.get("avg_daily_sales_28d", 0.0),
-            r.get("lead_time_mean_days", 0.0),
-            r.get("lead_time_std_days", 0.0),
-            service_level, order_up_factor
-        )
-        on_hand = float(r.get("on_hand_units", 0.0))
-        qty = max(0, int(np.ceil(S - on_hand)))
-        if qty > 0:
-            expl = (f"Inventario {on_hand:.0f} < ROP {rop:.1f} ⇒ sugerir pedido hasta S {S:.1f}. "
-                    f"(μ_LT={mu_lt:.2f}, σ_LT={sigma_lt:.2f}, z={z:.2f}, k={order_up_factor:.2f})")
-        else:
-            expl = (f"Inventario suficiente (on hand {on_hand:.0f} ≥ ROP {rop:.1f}).")
-        return pd.Series({"ROP": rop, "S_level": S, "RDP": rop, "suggested_order_qty": qty, "order_explanation": expl})
+    d = df.copy()
+    ads = pd.to_numeric(d.get("avg_daily_sales_28d", 0.0), errors="coerce").fillna(0.0).to_numpy()
+    lt_mean = pd.to_numeric(d.get("lead_time_mean_days", 0.0), errors="coerce").fillna(0.0).to_numpy()
+    lt_std  = pd.to_numeric(d.get("lead_time_std_days", 0.0), errors="coerce").fillna(0.0).to_numpy()
+    onh     = pd.to_numeric(d.get("on_hand_units", 0.0), errors="coerce").fillna(0.0).to_numpy()
 
-    extra = df.apply(_row_calc, axis=1)
-    enriched = pd.concat([df.reset_index(drop=True), extra], axis=1)
-    return enriched
+    z = z_from_service_level(float(service_level))
+    mu_lt = ads * lt_mean
+    sigma_lt = ads * lt_std
+    rop = mu_lt + z * sigma_lt
+    S   = rop + float(order_up_factor) * mu_lt
+    qty = np.maximum(0, np.ceil(S - onh)).astype(int)
+
+    d["ROP"] = np.maximum(0.0, rop)
+    d["S_level"] = np.maximum(0.0, S)
+    d["RDP"] = d["ROP"]
+    d["suggested_order_qty"] = qty
+
+    # --- PARCHE: construir explicaciones sin np.where para evitar broadcasting ---
+    mask = qty > 0
+    N = len(d)
+    expl = np.empty(N, dtype=object)
+
+    if mask.any():
+        expl_true = [
+            f"Inventario {int(oh)} < ROP {rp:.1f} ⇒ sugerir pedido hasta S {ss:.1f}."
+            for oh, rp, ss in zip(onh[mask], rop[mask], S[mask])
+        ]
+        expl[mask] = expl_true
+
+    if (~mask).any():
+        expl_false = [
+            f"Inventario suficiente (on hand {int(oh)} ≥ ROP {rp:.1f})."
+            for oh, rp in zip(onh[~mask], rop[~mask])
+        ]
+        expl[~mask] = expl_false
+
+    d["order_explanation"] = expl.tolist()
+    # --- fin parche ---
+
+    return d
 
 def suggest_order_for_row(row: dict, service_level: float = 0.95, order_up_factor: float = 1.0):
     rop, S, mu_lt, sigma_lt, z = compute_rop_s(

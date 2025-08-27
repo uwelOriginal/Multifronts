@@ -3,10 +3,15 @@ import os
 from pathlib import Path
 import pandas as pd
 
+DISABLE_IO = os.getenv("MULTIFRONTS_DISABLE_LOCAL_IO","0") == "1"
+
 def _append_csv(df: pd.DataFrame, path: Path) -> Path:
     """
     Append seguro que escribe encabezado si el archivo no existe o está vacío.
     """
+    if DISABLE_IO:
+        return path  # no-op en cloud para evitar I/O
+    
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = True
     mode = "w"

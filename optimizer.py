@@ -2,6 +2,16 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+def _effective_k_nearest(allowed_stores: set[str] | None, enriched: pd.DataFrame) -> int:
+    try:
+        if allowed_stores:
+            n = len(allowed_stores)
+        else:
+            n = enriched["store_id"].nunique()
+    except Exception:
+        n = 1
+    return max(1, min(n - 1, 50))
+
 def _nearest_donors_for_receiver(donors: pd.DataFrame, receiver_store: str, sku: str, distances: pd.DataFrame | None, k: int = 3) -> pd.DataFrame:
     """
     Devuelve hasta k donantes más cercanos al receiver_store para un sku dado.
@@ -66,6 +76,19 @@ def suggest_transfers(
         ["store_id", "sku_id", "surplus_qty", "ROP", "S_level", "on_hand_units"]
     ].copy()
 
+    k_nearest = _effective_k_nearest(allowed_stores, enriched)
+
+    # Prefiltro distancias UNA VEZ (si aplica)
+    if distances is not None and not distances.empty:
+        if allowed_stores:
+            distances = distances[distances["from_store"].isin(allowed_stores) & distances["to_store"].isin(allowed_stores)]
+        # Mantén sólo top-k_nearest por to_store para reducir joines posteriores:
+        distances = (
+            distances.sort_values(["to_store","distance_km"])
+                     .groupby("to_store", as_index=False)
+                     .head(k_nearest * 6)  # margen por SKU/empates
+        )
+
     if receivers.empty or donors.empty:
         return pd.DataFrame(columns=["sku_id", "from_store", "to_store", "qty", "distance_km"])
 
@@ -92,7 +115,7 @@ def suggest_transfers(
             if need <= 0:
                 continue
             # obtener donantes más cercanos
-            near = _nearest_donors_for_receiver(don_sku, r["store_id"], sku, distances, k=5)
+            near = _nearest_donors_for_receiver(don_sku, r["store_id"], sku, distances, k=k_nearest)
             if near is None or near.empty:
                 continue
 

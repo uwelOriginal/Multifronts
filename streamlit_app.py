@@ -1,21 +1,24 @@
-# streamlit_app.py
+# streamlit_app.py (parchado)
 import streamlit as st
 from pathlib import Path, PurePath
-import time, select, re, sys
+import time, select, re, sys, os, requests
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # Instanciar data csv
-from generate_data import init_all
+try:
+    from generate_data import init_all as _init_all
+except Exception:
+    _init_all = None
 
 # Núcleo y utilidades propias
 from core.load import load_data
 from core.headers import nice_headers
 from ui.kpis import kpi_cards
 from features.metrics import compute_baseline
-from services.auth import login_ui, get_current_user
+from services.auth import login_ui, register_ui, get_current_user
 from services.guardrails import get_allowed_sets
 from utils.labels import make_store_labels
 
@@ -39,9 +42,65 @@ import re, threading
 import queue as pyqueue
 
 # Para diagnosticar la base de datos
-from services import diagnostics as dx
+# from services import diagnostics as dx
 
-st.set_page_config(page_title="Control de Inventario — Operación & Resumen 4.5", layout="wide")
+# Config de página (evita re-renders raros)
+st.set_page_config(page_title="Multifronts", layout="wide", initial_sidebar_state="expanded")
+
+# === RUTAS/CONFIG BASE ===
+# DATA_DIR debe existir ANTES del login/registro
+DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# API base (Slack, backend)
+API_BASE = (
+    st.secrets.get("api", {}).get("base")
+    or os.environ.get("API_BASE")
+)
+
+# --- Slack helpers cacheados ---
+@st.cache_data(show_spinner=False, ttl=300)
+def _slack_workspace():
+    try:
+        r = requests.get(f"{API_BASE}/slack/workspace", timeout=6)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@st.cache_data(show_spinner=False, ttl=500)
+def _slack_status(org_id: str) -> dict:
+    try:
+        r = requests.get(f"{API_BASE}/slack/status", params={"org_id": org_id}, timeout=6)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@st.cache_data(show_spinner=False, ttl=500)
+def _slack_channel_info(org_id: str) -> dict:
+    try:
+        r = requests.get(f"{API_BASE}/debug/slack/channel_info", params={"org_id": org_id}, timeout=6)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def _slack_invite_self(org_id: str, email: str) -> dict:
+    try:
+        r = requests.post(
+            f"{API_BASE}/admin/slack/invite",
+            params={"org_id": org_id, "emails": email},
+            timeout=10,
+        )
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def _init_all_safe():
+    if _init_all:
+        try:
+            _init_all()
+        except Exception:
+            # No bloquees la app si el generador falla/no existe
+            pass
 
 def navbar(available_summary: bool) -> tuple[str, str]:
     mode = st.sidebar.radio("Modo", ["Simplificado", "Técnico"], index=1, key="nav_mode")
@@ -52,23 +111,27 @@ def navbar(available_summary: bool) -> tuple[str, str]:
     return mode, section
 
 def main():
-    # Carga datos crudos del repositorio
-    (DATA_DIR, stores, skus, sales, inv, lt, promos, distances, orders_c, transfers_c, notifications) = load_data()
-
-    if not (DATA_DIR / "stores.csv").exists():
-        init_all()
-
     st.title("🧭 MULTI FRONTS")
 
-    # ---- INSERTAR DIAGNOSTICO NEON AQUI -----
-
-    # Login obligatorio
+    # ---- Login/Registro en sidebar (formularios) ----
+    # NO cargar datos pesados hasta tener sesión.
     user, orgs_df = login_ui(DATA_DIR)
     actor = get_current_user()
     if not actor:
-        st.title("Inicio de sesión requerido")
-        st.info("Inicia sesión desde el panel lateral.")
+        # Si no hay sesión, muestra registro también (no bloquea; es form)
+        try:
+            register_ui(DATA_DIR)
+        except Exception:
+            pass
+        st.info("Inicia sesión o crea tu cuenta desde el panel lateral.")
         st.stop()
+
+    # ---- (Opcional) Generar CSV base si faltan tras login ----
+    if not (DATA_DIR / "stores.csv").exists():
+        _init_all_safe()
+
+    # ---- Ahora sí, carga de datos pesada (cacheada internamente) ----
+    (DATA_DIR_loaded, stores, skus, sales, inv, lt, promos, distances, orders_c, transfers_c, notifications) = load_data()
 
     st.caption(f"Sesión: **{actor.display_name or actor.email}** de **{actor.org_id}**")
 
@@ -134,7 +197,7 @@ def main():
         transfers_scoped=transfers_scoped,
     )
 
-    # Filtros (encapsulados)
+    # Filtros (encapsulados; el panel ya usa st.form para evitar reruns por tecla)
     fpanel = FilterPanel(ctx)
     filters = fpanel.render(mode=mode, default_expand=(section == "Operación"))
 
@@ -151,9 +214,74 @@ def main():
     # Render inicial
     render_views_in()
 
+    # ---- Bloque: Enlace de invitación al workspace Slack ----
+    with st.sidebar.expander("🙌 Únete al workspace de Slack", expanded=True):
+        ws = _slack_workspace()
+        invite_url = os.getenv("SLACK_WORKSPACE_INVITE_URL", "").strip() or None
+        team_id = (ws or {}).get("team_id")
+
+        if invite_url:
+            # Si tu versión de Streamlit soporta st.link_button, úsalo. Si no, usa st.markdown.
+            try:
+                st.link_button("Entrar al Slack (workspace)", invite_url, use_container_width=True)
+            except Exception:
+                st.markdown(f"[Entrar al Slack (workspace)]({invite_url})")
+
+            st.caption(
+                "Primero únete al workspace con el botón de arriba. "
+                "Luego podrás invitarte o unirte al canal de tu organización desde el bloque de Slack más abajo."
+            )
+        else:
+            st.info(
+                "Pide al admin que configure `SLACK_WORKSPACE_INVITE_URL` en el backend "
+                "para mostrar aquí el enlace de acceso al Workspace."
+            )
+
+        if team_id:
+            st.caption(f"Workspace ID: `{team_id}`")
+
+    # ---- Bloque: Canal Slack por organización ----
+    with st.sidebar.expander("🔔 Slack de tu organización", expanded=True):
+        org_id = ctx.org_id
+        user_email = ctx.actor_email
+        if not org_id:
+            st.info("Inicia sesión para ver tu canal de Slack.")
+        else:
+            st.caption("Canal asignado por organización (se crea automáticamente).")
+
+            info = _slack_channel_info(org_id)
+            status = _slack_status(org_id)
+
+            # 1) Enlace "técnico" solicitado (JSON con web_url etc.)
+            #st.markdown(
+            #    f"[Ver detalles del canal]({API_BASE}/debug/slack/channel_info?org_id={org_id})"
+            #)
+
+            # 2) Enlace directo a Slack si está disponible
+            web_url = (info or {}).get("web_url")
+            if web_url:
+                st.markdown(f"[Abrir canal de Slack]({web_url})")
+
+            # 3) Mostrar estado y permitir auto-invitación
+            if not (info or {}).get("ok"):
+                st.warning("Aún no hay canal registrado o falta autorización del bot.")
+            else:
+                ch = (info or {}).get("info", {}).get("channel", {})
+                is_private = ch.get("is_private", False)
+                st.write(f"Visibilidad: {'Privado' if is_private else 'Público'}")
+                if user_email:
+                    if st.button("Invitarme al canal"):
+                        resp = _slack_invite_self(org_id, user_email)
+                        if resp.get("ok"):
+                            st.success("Invitación enviada. Revisa Slack 👌")
+                        else:
+                            st.error(f"No se pudo invitar: {resp.get('error') or resp}")
+                else:
+                    st.caption("No detecté tu email; inicia sesión para poder invitarte automáticamente.")
+
     # ======= Live updates SIN recarga: Postgres LISTEN/NOTIFY =======
     st.session_state.setdefault("live_updates", True)
-    st.sidebar.toggle("🔔 Live updates", key="live_updates")
+    st.sidebar.toggle("⚡ Live updates", key="live_updates")
 
     if st.session_state["live_updates"]:
         if repo.DB_URL.startswith("sqlite"):

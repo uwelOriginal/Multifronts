@@ -10,8 +10,9 @@ from sqlalchemy import (
     select, func
 )
 
-from .repo import engine
+from .repo import get_engine
 
+engine = get_engine()
 meta = MetaData()
 
 # --- Tablas de cuentas/organización ---

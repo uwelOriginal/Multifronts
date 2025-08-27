@@ -57,110 +57,152 @@ class FilterPanel:
     def render(self, mode: str, default_expand: bool = True) -> FilterState:
         # 1) Reset por query param antes de instanciar widgets
         self._check_reset_param()
-
-        # 2) Defaults sólo en session_state
         self._ensure_defaults()
         defaults = self._defaults()
 
-        # 2.1) Normaliza estado EXISTENTE antes de crear widgets (seguro en Streamlit)
-        store_key = f"{self.k}stores"
-        cat_key   = f"{self.k}cats"
+        # Opciones vigentes (etiquetas)
+        stores_opts = sorted(self.ctx.id_to_label.values())
+        cats_opts = sorted(self.ctx.skus["category"].unique().tolist()) if not self.ctx.skus.empty else []
 
-        # Normalizar sucursales: elimina labels inexistentes; si queda vacío, usa todas
-        if isinstance(st.session_state.get(store_key, None), list):
-            st.session_state[store_key] = [x for x in st.session_state[store_key] if x in defaults["stores"]]
-            if not st.session_state[store_key]:
-                st.session_state[store_key] = list(defaults["stores"])
-        else:
-            st.session_state[store_key] = list(defaults["stores"])
+        # === Estado aplicado scopeado por organización (evita heredar de otra org) ===
+        APPLIED_KEY_OLD = f"{self.k}applied"
+        APPLIED_KEY = f"{self.k}applied:{self.ctx.org_id}"
 
-        # Normalizar categorías
-        if isinstance(st.session_state.get(cat_key, None), list):
-            st.session_state[cat_key] = [x for x in st.session_state[cat_key] if x in defaults["cats"]]
-            # si no hay categorías disponibles, deja lista vacía; si hay, usa todas
-            if defaults["cats"] and not st.session_state[cat_key]:
-                st.session_state[cat_key] = list(defaults["cats"])
-        else:
-            st.session_state[cat_key] = list(defaults["cats"])
+        # Migración suave: si existe la clave vieja y no la nueva, copia y elimina la vieja
+        if APPLIED_KEY not in st.session_state and APPLIED_KEY_OLD in st.session_state:
+            st.session_state[APPLIED_KEY] = st.session_state.get(APPLIED_KEY_OLD, {}).copy()
+            try:
+                del st.session_state[APPLIED_KEY_OLD]
+            except Exception:
+                pass
+
+        # Inicializa estado aplicado si no existe
+        if APPLIED_KEY not in st.session_state:
+            st.session_state[APPLIED_KEY] = {
+                "stores": list(defaults["stores"]),
+                "cats": list(defaults["cats"]),
+                "abc": ["A", "B", "C"],
+                "service": float(defaults["service"]),
+                "s_factor": float(defaults["s_factor"]),
+            }
+
+        # Normaliza el estado aplicado contra las opciones ACTUALES (muy importante)
+        applied = st.session_state[APPLIED_KEY]
+        applied["stores"] = [lbl for lbl in (applied.get("stores") or []) if lbl in stores_opts] or stores_opts
+        applied["cats"]   = [c for c in (applied.get("cats") or []) if c in cats_opts] or cats_opts
+        if not applied.get("abc"):
+            applied["abc"] = ["A","B","C"]
 
         st.markdown('<span id="filters-start"></span>', unsafe_allow_html=True)
-
         with st.expander("Parámetros & Filtros", expanded=False):
-            # ---------- Fila 1: Sucursales y Categorías ----------
-            c1, c2 = st.columns([1.6, 1.4])
+            # -------- BORRADOR en FORM: no aplica hasta Submit --------
+            with st.form("filters_form", clear_on_submit=False):
+                c1, c2 = st.columns([1.6, 1.4])
 
-            store_labels_sel = c1.multiselect(
-                "Sucursales",
-                options=defaults["stores"],
-                help="Filtra tiendas visibles (etiquetas locales a tu organización, p.ej. S01 — CDMX).",
-                key=store_key,
-            )
-            # Fallback local si el usuario deja vacío: aplica 'todas' SIN escribir session_state
-            effective_store_labels = store_labels_sel or defaults["stores"]
-            if not store_labels_sel and defaults["stores"]:
-                c1.caption("Sin selección ⇒ **todas** las sucursales.")
-            store_sel = [self.ctx.label_to_id[lbl] for lbl in effective_store_labels]
+                # Los defaults del formulario son el borrador actual
+                draft_stores = st.session_state.get(f"{self.k}stores", applied["stores"])
+                draft_cats   = st.session_state.get(f"{self.k}cats", applied["cats"])
 
-            cat_sel = c2.multiselect(
-                "Categorías",
-                options=defaults["cats"],
-                help="Familias de producto (puedes combinarlas con ABC para priorizar).",
-                key=cat_key,
-            )
-            effective_cats = cat_sel or defaults["cats"]
-            if not cat_sel and defaults["cats"]:
-                c2.caption("Sin selección ⇒ **todas** las categorías.")
+                # Normaliza borrador con catálogo vigente
+                draft_stores = [x for x in draft_stores if x in stores_opts] or stores_opts
+                draft_cats   = [x for x in draft_cats   if x in cats_opts]   or cats_opts
 
-            # ---------- Fila 2: ABC (toggles) ----------
-            t1, t2, t3 = st.columns(3)
-            abc_a = t1.toggle("A 🔴", key=f"{self.k}abc_a", help="Alta prioridad (alto impacto/rotación)")
-            abc_b = t2.toggle("B 🟠", key=f"{self.k}abc_b", help="Prioridad media")
-            abc_c = t3.toggle("C 🟡", key=f"{self.k}abc_c", help="Prioridad baja")
-
-            abc_sel = [x for x, v in zip(["A","B","C"], [abc_a, abc_b, abc_c]) if v]
-            if not abc_sel:
-                abc_sel = ["A","B","C"]
-
-            # ---------- Fila 3: controles avanzados ----------
-            with st.expander("⚙️ Controles avanzados", expanded=(mode == "Técnico")):
-                a1, a2 = st.columns(2)
-                service_level = a1.slider(
-                    "Nivel de servicio (z implícito)",
-                    0.80, 0.99, step=0.01,
-                    help="Objetivo de fill-rate; determina el factor z del stock de seguridad en ROP.",
-                    key=f"{self.k}service",
+                store_labels_sel = c1.multiselect(
+                    "Sucursales", options=stores_opts, default=draft_stores, key=f"{self.k}stores",
+                    help="Filtra tiendas visibles."
                 )
-                order_up_factor = a2.number_input(
-                    "Factor S (× μ_LT)",
-                    min_value=0.1, max_value=3.0, step=0.1,
-                    help="Multiplicador para el nivel S (hasta dónde reponer sobre la demanda del lead time).",
-                    key=f"{self.k}s_factor",
+                cat_sel = c2.multiselect(
+                    "Categorías", options=cats_opts, default=draft_cats, key=f"{self.k}cats",
+                    help="Familias de producto."
                 )
 
-            st.caption(
-                "ABC = prioridad por impacto/rotación: **A** alto, **B** medio, **C** bajo. "
-                "Revisa primero A, luego B; C se monitorea con umbrales más amplios."
-            )
+                t1, t2, t3 = st.columns(3)
+                abc_a = t1.toggle("A 🔴", key=f"{self.k}abc_a", value=st.session_state.get(f"{self.k}abc_a", True))
+                abc_b = t2.toggle("B 🟠", key=f"{self.k}abc_b", value=st.session_state.get(f"{self.k}abc_b", True))
+                abc_c = t3.toggle("C 🟡", key=f"{self.k}abc_c", value=st.session_state.get(f"{self.k}abc_c", True))
+                abc_sel = [x for x, v in zip(["A","B","C"], [abc_a, abc_b, abc_c]) if v] or ["A","B","C"]
+
+                with st.expander("⚙️ Controles avanzados", expanded=(mode == "Técnico")):
+                    a1, a2 = st.columns(2)
+                    service_level = a1.slider(
+                        "Nivel de servicio (z implícito)", 0.80, 0.99, step=0.01,
+                        key=f"{self.k}service",
+                        value=float(st.session_state.get(f"{self.k}service", defaults["service"])),
+                    )
+                    order_up_factor = a2.number_input(
+                        "Factor S (× μ_LT)", min_value=0.1, max_value=3.0, step=0.1,
+                        key=f"{self.k}s_factor",
+                        value=float(st.session_state.get(f"{self.k}s_factor", defaults["s_factor"])),
+                    )
+
+                apply_btn = st.form_submit_button("Aplicar filtros", use_container_width=True)
+
+            # -------- Al pulsar, “congelamos” en APPLIED y saneamos selección --------
+            if apply_btn:
+                sel_stores = [lbl for lbl in (store_labels_sel or []) if lbl in stores_opts] or stores_opts
+                sel_cats   = [c for c in (cat_sel or []) if c in cats_opts] or cats_opts
+                st.session_state[APPLIED_KEY] = {
+                    "stores": sel_stores,
+                    "cats": sel_cats,
+                    "abc": abc_sel,
+                    "service": float(service_level),
+                    "s_factor": float(order_up_factor),
+                }
+                applied = st.session_state[APPLIED_KEY]  # refresca referencia
+
+        # Construir FilterState desde estado APLICADO (mapear etiquetas → IDs con tolerancia)
+        applied = st.session_state[APPLIED_KEY]
+        # Vuelve a normalizar por si cambió el catálogo durante el form
+        applied["stores"] = [lbl for lbl in (applied.get("stores") or []) if lbl in stores_opts] or stores_opts
+        # Mapear a IDs de forma segura (evita KeyError)
+        stores_ids = [self.ctx.label_to_id[lbl] for lbl in applied["stores"] if lbl in self.ctx.label_to_id]
+        if not stores_ids:
+            # Fallback: todas las opciones vigentes
+            stores_ids = [self.ctx.label_to_id[lbl] for lbl in stores_opts if lbl in self.ctx.label_to_id]
 
         return FilterState(
-            store_sel=store_sel,
-            cat_sel=effective_cats,
-            abc_sel=abc_sel,
-            service_level=float(st.session_state[f"{self.k}service"]),
-            order_up_factor=float(st.session_state[f"{self.k}s_factor"]),
+            store_sel=stores_ids,
+            cat_sel=applied["cats"],
+            abc_sel=applied["abc"],
+            service_level=float(applied["service"]),
+            order_up_factor=float(applied["s_factor"]),
         )
 
-    def apply_to(self,
-                 df_sales: pd.DataFrame,
-                 df_inv: pd.DataFrame,
-                 df_lt: pd.DataFrame,
-                 df_skus: pd.DataFrame,
-                 f: FilterState):
+
+    @staticmethod
+    @st.cache_data(show_spinner=False, ttl=180)
+    def _apply_filters_cached(
+        _df_sales: pd.DataFrame,
+        _df_inv: pd.DataFrame,
+        _df_lt: pd.DataFrame,
+        _df_skus: pd.DataFrame,   # se ignora en el filtrado, pero lo dejamos para simetría
+        store_ids: tuple[str, ...],   # <-- SIN guion bajo (sí se hashea)
+        sku_ids: tuple[str, ...],     # <-- SIN guion bajo (sí se hashea)
+    ):
+        """Filtra dataframes por tiendas/SKUs. Los parámetros con '_' no se hashean."""
+        sales_f = _df_sales[
+            (_df_sales["store_id"].isin(store_ids)) & (_df_sales["sku_id"].isin(sku_ids))
+        ].copy()
+        inv_f = _df_inv[
+            (_df_inv["store_id"].isin(store_ids)) & (_df_inv["sku_id"].isin(sku_ids))
+        ].copy()
+        lt_f = _df_lt[
+            (_df_lt["store_id"].isin(store_ids)) & (_df_lt["sku_id"].isin(sku_ids))
+        ].copy()
+        return sales_f, inv_f, lt_f
+
+    def apply_to(self, df_sales, df_inv, df_lt, df_skus, f):
+        # 1) SKUs permitidos por categoría/ABC (igual que antes)
         allowed = df_skus[
-            (df_skus["category"].isin(f.cat_sel)) &
-            (df_skus["abc_class"].isin([x for x in ["A","B","C"] if x in f.abc_sel]))
+            (df_skus["category"].isin(f.cat_sel)) & (df_skus["abc_class"].isin(f.abc_sel))
         ]["sku_id"].tolist()
-        sales_f = df_sales[(df_sales["store_id"].isin(f.store_sel)) & (df_sales["sku_id"].isin(allowed))]
-        inv_f   = df_inv  [(df_inv["store_id"].isin(f.store_sel))   & (df_inv["sku_id"].isin(allowed))]
-        lt_f    = df_lt   [(df_lt["store_id"].isin(f.store_sel))    & (df_lt["sku_id"].isin(allowed))]
+
+        # 2) Clave de cache: ids ordenados (tuplas inmutables)
+        store_ids = tuple(sorted(f.store_sel))
+        sku_ids   = tuple(sorted(allowed))
+
+        # 3) Llamar al helper de módulo (¡sin self!)
+        sales_f, inv_f, lt_f = self._apply_filters_cached(
+            df_sales, df_inv, df_lt, df_skus, store_ids, sku_ids
+        )
         return sales_f, inv_f, lt_f, allowed

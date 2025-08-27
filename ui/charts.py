@@ -88,3 +88,7 @@ def category_dashboard_chart(by_cat: pd.DataFrame):
         .properties(height=260)
     )
     st.altair_chart(chart, use_container_width=True)
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _to_long(df, id_vars, value_vars, var_name, value_name):
+    return pd.melt(df.copy(), id_vars=id_vars, value_vars=value_vars, var_name=var_name, value_name=value_name)

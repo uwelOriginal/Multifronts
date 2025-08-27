@@ -1,3 +1,4 @@
+# backend/api/routes_slack.py
 import json, urllib.parse, httpx, os
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import RedirectResponse, PlainTextResponse
@@ -17,13 +18,17 @@ SLACK_API           = "https://slack.com/api"
 
 router = APIRouter()
 
+@router.get("/slack/workspace")
+def slack_workspace():
+    at = auth_test()
+    return {"ok": bool(at.get("ok")), "team_id": at.get("team") or at.get("team_id"), "raw": at}
+
 @router.get("/slack/status")
 def slack_status(org_id: str):
     with engine.begin() as conn:
         ensure_slack_tables(conn)
         inst = get_installation(conn, org_id)
-        hq   = get_hq_channel(conn, org_id)  # incluye is_private si está en DB
-        # agrega visibility si está en DB
+        hq   = get_hq_channel(conn, org_id)
         if hq:
             hq["visibility"] = ("private" if hq.get("is_private") else "public")
         return {
@@ -66,7 +71,6 @@ def _slack_authorize_url(state: str, scopes: list[str]) -> str:
 def slack_install(org_id: str, return_url: str | None = None):
     if not SLACK_CLIENT_ID or not OAUTH_REDIRECT_URL:
         raise HTTPException(status_code=500, detail="OAuth no configurado")
-    # incluye scopes para crear/listar/invitar
     scopes = ["incoming-webhook","chat:write","channels:read","conversations:read","conversations:write","groups:write","users:read.email","users:read"]
     state = json.dumps({"org_id": org_id, "return_url": return_url or ""})
     url = _slack_authorize_url(state, scopes=scopes)
@@ -107,7 +111,6 @@ def slack_oauth_redirect(code: str | None = None, state: str | None = None):
                   incoming_webhook_url = COALESCE(EXCLUDED.incoming_webhook_url, slack_installations.incoming_webhook_url),
                   default_channel_id = COALESCE(EXCLUDED.default_channel_id, slack_installations.default_channel_id)
         """), {"o": org_id, "t": team_id, "bt": bot_token, "wh": webhook_url, "dc": webhook_channel})
-        # fallback: canal HQ
         ensure_hq_channel(conn, org_id)
 
     if return_url:
@@ -119,22 +122,18 @@ def slack_oauth_redirect(code: str | None = None, state: str | None = None):
         return RedirectResponse(dest)
     return PlainTextResponse("Slack conectado para org: " + str(org_id))
 
-# --------- Diagnóstico extra ---------
-
 @router.get("/debug/slack/check")
 def slack_check():
     return auth_test()
 
 @router.get("/debug/slack/channel_info")
 def slack_channel_info(org_id: str):
-    """Lee channel_id desde Neon y consulta conversations.info en Slack."""
     with engine.begin() as conn:
         ensure_slack_tables(conn)
         ch = get_hq_channel(conn, org_id)
     if not ch or not ch.get("channel_id"):
         return {"ok": False, "error": "no_channel_in_db", "org_id": org_id}
     info = get_channel_info(ch["channel_id"])
-    # link útil en Slack web si tenemos team_id
     at = auth_test()
     team_id = at.get("team_id") or at.get("team")
     web_url = f"https://app.slack.com/client/{team_id}/{ch['channel_id']}" if (team_id and ch.get("channel_id")) else None
@@ -142,7 +141,6 @@ def slack_channel_info(org_id: str):
 
 @router.get("/debug/slack/find")
 def slack_find(name: str):
-    """Busca por nombre exacto en conversations.list (filtra en cliente)."""
     return find_channels_by_name(name)
 
 @router.post("/admin/slack/invite")
@@ -153,16 +151,3 @@ def slack_invite(org_id: str, emails: str = Query("", description="comma-separat
     with engine.begin() as conn:
         res = invite_emails_to_org_channel(conn, org_id, emails_list)
         return res
-
-@router.get("/debug/dbinfo")
-def debug_dbinfo():
-    url = os.getenv("DATABASE_URL","")
-    masked = url
-    if "@" in url and ":" in url.split("@")[0]:
-        creds, hostpart = url.split("@", 1)
-        user = creds.split("//",1)[-1].split(":")[0]
-        masked = url.replace(creds, f"//{user}:*****")
-    with engine.begin() as conn:
-        ver = conn.execute(text("SELECT version()")).scalar_one()
-        orgs = conn.execute(text("SELECT COUNT(*) FROM orgs")).scalar_one()
-    return {"db_url": masked, "db_has_orgs": orgs, "pg_version": ver}

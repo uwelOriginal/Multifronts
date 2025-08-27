@@ -9,7 +9,7 @@ from urllib.parse import quote_plus, urlparse
 import pandas as pd
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String, DateTime, Numeric,
-    UniqueConstraint, insert, select, text
+    UniqueConstraint, insert, select
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
@@ -67,22 +67,31 @@ def _get_database_url() -> str:
 
 DB_URL: str = _get_database_url()
 
-# Pool pequeño para Streamlit Cloud (menos latencia)
-engine_args = dict(future=True)
-if DB_URL.startswith("sqlite"):
-    engine = create_engine(
-        DB_URL,
-        connect_args={"check_same_thread": False},
-        **engine_args
-    )
+def _engine_args_for(url: str) -> dict:
+    base = dict(future=True)
+    if url.startswith("sqlite"):
+        return {**base, "connect_args": {"check_same_thread": False}}
+    # Neon/pg: pool chico estable
+    return {
+        **base,
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "5")),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "2")),
+        "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "10")),
+        "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "300")),
+    }
+
+# Cachea el Engine SOLO en procesos con Streamlit (evita recrearlo en cada rerun)
+if st is not None:
+    @st.cache_resource(show_spinner=False)
+    def _cached_engine(url: str, args: dict) -> Engine:
+        return create_engine(url, **args)
+    engine: Engine = _cached_engine(DB_URL, _engine_args_for(DB_URL))
 else:
-    engine = create_engine(
-        DB_URL,
-        pool_pre_ping=True,
-        pool_size=5,        # <— controla conexiones concurrentes
-        max_overflow=2,     # <— evita latencia por apertura excesiva
-        **engine_args
-    )
+    engine: Engine = create_engine(DB_URL, **_engine_args_for(DB_URL))
+
+def get_engine() -> Engine:
+    return engine
 
 def mask_url(url: str) -> str:
     try:
@@ -139,9 +148,6 @@ transfers_tbl = Table(
     sqlite_autoincrement=True,
 )
 
-# =================================
-# Inventario vivo (estado en Neon)
-# =================================
 inventory_tbl = Table(
     "inventory_levels", meta,
     Column("id", Integer, primary_key=True, autoincrement=True),
@@ -160,10 +166,6 @@ def ensure_movements_schema() -> None:
 def _now_utc() -> _dt.datetime:
     return _dt.datetime.utcnow()
 
-# ===========================
-# Seeder / Lectura de estado
-# ===========================
-
 def seed_inventory_from_snapshot(
     org_id: str,
     snapshot_df: pd.DataFrame,
@@ -171,25 +173,17 @@ def seed_inventory_from_snapshot(
     sku_col: str = "sku_id",
     on_hand_col: str = "on_hand_units",
 ) -> int:
-    """
-    Carga inicial del inventario vivo a partir de un CSV/DF de snapshot.
-    Upsert por (org_id, store_id, sku_id).
-    Devuelve número de filas afectadas.
-    """
     ensure_movements_schema()
     if snapshot_df is None or snapshot_df.empty:
         return 0
-
     df = snapshot_df[[store_col, sku_col, on_hand_col]].copy()
     df = df.rename(columns={store_col: "store_id", sku_col: "sku_id", on_hand_col: "on_hand"})
     df["org_id"] = org_id
     df["updated_at"] = _now_utc()
 
-    dialect = engine.dialect.name
     affected = 0
     with engine.begin() as conn:
-        if dialect == "postgresql":
-            # Upsert en batch (Postgres)
+        if engine.dialect.name == "postgresql":
             sql = """
             INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
             VALUES (:org_id, :store_id, :sku_id, :on_hand, :updated_at)
@@ -197,7 +191,6 @@ def seed_inventory_from_snapshot(
             DO UPDATE SET on_hand = EXCLUDED.on_hand, updated_at = EXCLUDED.updated_at;
             """
         else:
-            # SQLite
             sql = """
             INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
             VALUES (:org_id, :store_id, :sku_id, :on_hand, :updated_at)
@@ -213,14 +206,7 @@ def fetch_inventory_levels(
     store_ids: Optional[List[str]] = None,
     sku_ids: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """
-    Lee el inventario vivo desde BD usando SQLAlchemy Core.
-    - Convierte sets/tuples a list de strings
-    - Usa .in_(...) en lugar de ANY(...) para evitar problemas de adaptación
-    """
     ensure_movements_schema()
-
-    # Normaliza tipos (evita 'set' → psycopg ProgrammingError)
     stores_list = [str(s) for s in list(store_ids) ] if store_ids else None
     skus_list   = [str(s) for s in list(sku_ids)   ] if sku_ids   else None
 
@@ -238,21 +224,9 @@ def fetch_inventory_levels(
 
     with engine.begin() as conn:
         df = pd.read_sql(stmt, conn)
-
     return df
 
-
-# =========================================
-# Persistencia idempotente + efectos stock
-# =========================================
-
-def save_orders(
-    *, org_id: str, rows: List[Dict], approved_by: str, idem_prefix: str
-) -> tuple[int, int]:
-    """
-    Inserta pedidos de forma idempotente. (No afectan 'on_hand' — son pedidos, no recepción).
-    Devuelve (nuevos, duplicados).
-    """
+def save_orders(*, org_id: str, rows: List[Dict], approved_by: str, idem_prefix: str) -> tuple[int, int]:
     ensure_movements_schema()
     nuevos, duplicados = 0, 0
     with engine.begin() as conn:
@@ -285,18 +259,11 @@ def save_orders(
 def save_transfers(
     *, org_id: str, rows: List[Dict], approved_by: str, idem_prefix: str
 ) -> tuple[int, int, int]:
-    """
-    Inserta transferencias de forma idempotente y APLICA EFECTOS en inventario:
-    - decrementa on_hand en 'from_store' (si hay stock suficiente)
-    - incrementa on_hand en 'to_store' (upsert)
-    Devuelve (aplicadas, duplicadas, insuficientes).
-    """
     ensure_movements_schema()
     applied, dup, insufficient = 0, 0, 0
     dialect = engine.dialect.name
 
     with engine.begin() as conn:
-        # Precrear filas de inventario con on_hand=0 para claves faltantes (evita nulls)
         def _ensure_key(store_id: str, sku_id: str) -> None:
             if dialect == "postgresql":
                 conn.exec_driver_sql(
@@ -335,7 +302,6 @@ def save_transfers(
             if from_store == to_store:
                 continue
 
-            # 1) idempotencia de movimiento
             payload = {
                 "org_id": org_id,
                 "from_store": from_store,
@@ -348,70 +314,35 @@ def save_transfers(
             }
             try:
                 conn.execute(insert(transfers_tbl), [payload])
-                is_duplicate = False
             except IntegrityError:
                 dup += 1
-                is_duplicate = True
-
-            if is_duplicate:
-                # Ya insertada antes: no volvemos a aplicar efecto de stock.
                 continue
 
-            # 2) Asegurar claves
             _ensure_key(from_store, sku_id)
             _ensure_key(to_store, sku_id)
 
-            # 3) Decremento atómico (no permitir negativos)
-            if dialect == "postgresql":
-                res = conn.exec_driver_sql(
-                    """
-                    UPDATE inventory_levels
-                    SET on_hand = on_hand - :qty, updated_at = NOW()
-                    WHERE org_id = :org_id AND store_id = :from_store AND sku_id = :sku_id
-                      AND on_hand >= :qty;
-                    """,
-                    {"org_id": org_id, "from_store": from_store, "sku_id": sku_id, "qty": qty},
-                )
-            else:
-                res = conn.exec_driver_sql(
-                    """
-                    UPDATE inventory_levels
-                    SET on_hand = on_hand - :qty, updated_at = CURRENT_TIMESTAMP
-                    WHERE org_id = :org_id AND store_id = :from_store AND sku_id = :sku_id
-                      AND on_hand >= :qty;
-                    """,
-                    {"org_id": org_id, "from_store": from_store, "sku_id": sku_id, "qty": qty},
-                )
-            if res.rowcount != 1:
-                # No había stock suficiente; deshacemos el registro de transfer para no perder idempotencia
-                # (opcional: mantenerlo con estatus 'rejected', aquí simplemente lo contamos como insuficiente)
+            res = conn.exec_driver_sql(
+                """
+                UPDATE inventory_levels
+                   SET on_hand = on_hand - :q, updated_at = NOW()
+                 WHERE org_id=:o AND store_id=:s AND sku_id=:k AND on_hand >= :q
+                """,
+                {"o": org_id, "s": from_store, "k": sku_id, "q": qty},
+            )
+            if res.rowcount == 0:
                 insufficient += 1
                 continue
 
-            # 4) Incremento (upsert) en destino
-            if dialect == "postgresql":
-                conn.exec_driver_sql(
-                    """
-                    INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
-                    VALUES (:org_id, :to_store, :sku_id, :qty, NOW())
-                    ON CONFLICT (org_id, store_id, sku_id)
-                    DO UPDATE SET on_hand = inventory_levels.on_hand + EXCLUDED.on_hand,
-                                  updated_at = NOW();
-                    """,
-                    {"org_id": org_id, "to_store": to_store, "sku_id": sku_id, "qty": qty},
-                )
-            else:
-                conn.exec_driver_sql(
-                    """
-                    INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
-                    VALUES (:org_id, :to_store, :sku_id, :qty, CURRENT_TIMESTAMP)
-                    ON CONFLICT(org_id, store_id, sku_id)
-                    DO UPDATE SET on_hand = on_hand + excluded.on_hand,
-                                  updated_at = CURRENT_TIMESTAMP;
-                    """,
-                    {"org_id": org_id, "to_store": to_store, "sku_id": sku_id, "qty": qty},
-                )
-
+            conn.exec_driver_sql(
+                """
+                INSERT INTO inventory_levels(org_id, store_id, sku_id, on_hand, updated_at)
+                VALUES (:o, :s, :k, :q, NOW())
+                ON CONFLICT (org_id, store_id, sku_id)
+                DO UPDATE SET on_hand = inventory_levels.on_hand + EXCLUDED.on_hand,
+                              updated_at = NOW();
+                """,
+                {"o": org_id, "s": to_store, "k": sku_id, "q": qty},
+            )
             applied += 1
 
     return applied, dup, insufficient
