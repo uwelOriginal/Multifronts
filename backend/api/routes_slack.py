@@ -4,7 +4,10 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import RedirectResponse, PlainTextResponse
 from sqlalchemy import text
 from .dbconn import engine
-from .slack_utils import ensure_slack_tables, get_installation, get_hq_channel, ensure_hq_channel
+from .slack_utils import (
+    ensure_slack_tables, get_installation, get_hq_channel,
+    ensure_hq_channel, ensure_hq_channel_verbose
+)
 
 SLACK_CLIENT_ID     = os.getenv("SLACK_CLIENT_ID","")
 SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET","")
@@ -29,17 +32,27 @@ def slack_status(org_id: str):
             "hq_channel": hq or {},
         }
 
+@router.post("/admin/slack/ensure")
+def slack_ensure(org_id: str):
+    with engine.begin() as conn:
+        ensure_slack_tables(conn)
+        res = ensure_hq_channel_verbose(conn, org_id)
+        return res
+
 @router.post("/admin/slack/reconcile")
 def slack_reconcile():
+    results = []
     created_or_verified = 0
     with engine.begin() as conn:
         ensure_slack_tables(conn)
         rows = conn.execute(text("SELECT org_id FROM orgs")).all()
         for row in rows:
             org_id = row[0]
-            if ensure_hq_channel(conn, org_id):
+            res = ensure_hq_channel_verbose(conn, org_id)
+            if res.get("ok"):
                 created_or_verified += 1
-    return {"ok": True, "created_or_verified": created_or_verified}
+            results.append({"org_id": org_id, **res})
+    return {"ok": True, "created_or_verified": created_or_verified, "results": results}
 
 def _slack_authorize_url(state: str, scopes: list[str]) -> str:
     params = {"client_id": SLACK_CLIENT_ID, "scope": " ".join(scopes), "redirect_uri": OAUTH_REDIRECT_URL, "state": state}
@@ -50,7 +63,7 @@ def slack_install(org_id: str, return_url: str | None = None):
     if not SLACK_CLIENT_ID or not OAUTH_REDIRECT_URL:
         raise HTTPException(status_code=500, detail="OAuth no configurado")
     state = json.dumps({"org_id": org_id, "return_url": return_url or ""})
-    url = _slack_authorize_url(state, scopes=["incoming-webhook","chat:write","conversations:read","conversations:write"])
+    url = _slack_authorize_url(state, scopes=["incoming-webhook","chat:write","channels:read","conversations:read","conversations:write","groups:write"])
     return RedirectResponse(url)
 
 @router.get("/slack/oauth_redirect")
@@ -88,7 +101,7 @@ def slack_oauth_redirect(code: str | None = None, state: str | None = None):
                   incoming_webhook_url = COALESCE(EXCLUDED.incoming_webhook_url, slack_installations.incoming_webhook_url),
                   default_channel_id = COALESCE(EXCLUDED.default_channel_id, slack_installations.default_channel_id)
         """), {"o": org_id, "t": team_id, "bt": bot_token, "wh": webhook_url, "dc": webhook_channel})
-        # fallback: crea/asegura canal HQ también
+        # Asegura canal HQ como fallback
         ensure_hq_channel(conn, org_id)
 
     if return_url:
@@ -99,6 +112,50 @@ def slack_oauth_redirect(code: str | None = None, state: str | None = None):
         dest = urllib.parse.urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
         return RedirectResponse(dest)
     return PlainTextResponse("Slack conectado para org: " + str(org_id))
+
+@router.get("/debug/slack/check")
+def slack_check():
+    """Valida que SLACK_HQ_BOT_TOKEN existe y es válido contra auth.test."""
+    token = os.getenv("SLACK_HQ_BOT_TOKEN", "").strip()
+    has_token = bool(token and token.startswith("xoxb-"))
+    auth_ok = False
+    team = None
+    bot_user_id = None
+    scopes = None
+    error = None
+    if has_token:
+        try:
+            with httpx.Client(timeout=6.0) as client:
+                r = client.post(f"{SLACK_API}/auth.test",
+                                headers={"Authorization": f"Bearer {token}"})
+                jd = r.json()
+                auth_ok = bool(jd.get("ok"))
+                team = jd.get("team_id") or jd.get("team")
+                bot_user_id = jd.get("user_id") or jd.get("bot_id")
+                # algunos tokens exponen scopes en response_metadata
+                scopes = (jd.get("response_metadata") or {}).get("scopes")
+                if not auth_ok:
+                    error = jd.get("error")
+        except Exception as e:
+            error = str(e)
+    return {
+        "has_token": has_token,
+        "auth_ok": auth_ok,
+        "team": team,
+        "bot_user_id": bot_user_id,
+        "scopes": scopes,
+        "error": error,
+    }
+
+@router.get("/debug/slack/scopes")
+def slack_scopes():
+    """Alias simple que sólo devuelve los scopes (si Slack los incluye en auth.test)."""
+    token = os.getenv("SLACK_HQ_BOT_TOKEN", "").strip()
+    with httpx.Client(timeout=6.0) as client:
+        r = client.post(f"{SLACK_API}/auth.test",
+                        headers={"Authorization": f"Bearer {token}"})
+        jd = r.json()
+    return {"ok": jd.get("ok"), "scopes": (jd.get("response_metadata") or {}).get("scopes")}
 
 @router.get("/debug/dbinfo")
 def debug_dbinfo():
@@ -112,43 +169,3 @@ def debug_dbinfo():
         ver = conn.execute(text("SELECT version()")).scalar_one()
         orgs = conn.execute(text("SELECT COUNT(*) FROM orgs")).scalar_one()
     return {"db_url": masked, "db_has_orgs": orgs, "pg_version": ver}
-
-# ===== NUEVOS endpoints de diagnóstico/forzado =====
-
-@router.get("/debug/slack/check")
-def slack_check():
-    """Valida que SLACK_HQ_BOT_TOKEN existe y es válido contra auth.test."""
-    token = os.getenv("SLACK_HQ_BOT_TOKEN", "").strip()
-    has_token = bool(token and token.startswith("xoxb-"))
-    auth_ok = False
-    team = None
-    bot_user_id = None
-    error = None
-    if has_token:
-        try:
-            with httpx.Client(timeout=6.0) as client:
-                r = client.post(f"{SLACK_API}/auth.test",
-                                headers={"Authorization": f"Bearer {token}"})
-                jd = r.json()
-                auth_ok = bool(jd.get("ok"))
-                team = jd.get("team_id") or jd.get("team")
-                bot_user_id = jd.get("user_id") or jd.get("bot_id")
-                if not auth_ok:
-                    error = jd.get("error")
-        except Exception as e:
-            error = str(e)
-    return {
-        "has_token": has_token,
-        "auth_ok": auth_ok,
-        "team": team,
-        "bot_user_id": bot_user_id,
-        "error": error,
-    }
-
-@router.post("/admin/slack/ensure")
-def slack_ensure(org_id: str):
-    """Fuerza la creación/aseguramiento del canal #mf-{org_id} y lo persiste en slack_channels."""
-    with engine.begin() as conn:
-        ensure_slack_tables(conn)
-        cid = ensure_hq_channel(conn, org_id)
-        return {"ok": bool(cid), "channel_id": cid}
