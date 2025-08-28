@@ -4,6 +4,10 @@ import pandas as pd
 from typing import Tuple
 from core.context import AppContext, FilterState
 
+def _default_kw_for(key: str, **kwargs):
+    """Devuelve kwargs (p.ej., default=..., value=...) solo si la key aún no existe."""
+    return {} if key in st.session_state else kwargs
+
 class FilterPanel:
     def __init__(self, ctx: AppContext, key_prefix: str = "hdr_"):
         self.ctx = ctx
@@ -108,18 +112,23 @@ class FilterPanel:
                 draft_cats   = [x for x in draft_cats   if x in cats_opts]   or cats_opts
 
                 store_labels_sel = c1.multiselect(
-                    "Sucursales", options=stores_opts, default=draft_stores, key=f"{self.k}stores",
+                    "Sucursales", options=stores_opts, key=f"{self.k}stores",
+                    **_default_kw_for(f"{self.k}stores", default=draft_stores),
                     help="Filtra tiendas visibles."
                 )
                 cat_sel = c2.multiselect(
-                    "Categorías", options=cats_opts, default=draft_cats, key=f"{self.k}cats",
+                    "Categorías", options=cats_opts, key=f"{self.k}cats",
+                    **_default_kw_for(f"{self.k}cats", default=draft_cats),
                     help="Familias de producto."
                 )
 
                 t1, t2, t3 = st.columns(3)
-                abc_a = t1.toggle("A 🔴", key=f"{self.k}abc_a", value=st.session_state.get(f"{self.k}abc_a", True))
-                abc_b = t2.toggle("B 🟠", key=f"{self.k}abc_b", value=st.session_state.get(f"{self.k}abc_b", True))
-                abc_c = t3.toggle("C 🟡", key=f"{self.k}abc_c", value=st.session_state.get(f"{self.k}abc_c", True))
+                abc_a = t1.toggle("A 🔴", key=f"{self.k}abc_a",
+                                  **_default_kw_for(f"{self.k}abc_a", value=st.session_state.get(f"{self.k}abc_a", True)))
+                abc_b = t2.toggle("B 🟠", key=f"{self.k}abc_b",
+                                  **_default_kw_for(f"{self.k}abc_b", value=st.session_state.get(f"{self.k}abc_b", True)))
+                abc_c = t3.toggle("C 🟡", key=f"{self.k}abc_c",
+                                  **_default_kw_for(f"{self.k}abc_c", value=st.session_state.get(f"{self.k}abc_c", True)))
                 abc_sel = [x for x, v in zip(["A","B","C"], [abc_a, abc_b, abc_c]) if v] or ["A","B","C"]
 
                 with st.expander("⚙️ Controles avanzados", expanded=(mode == "Técnico")):
@@ -127,12 +136,12 @@ class FilterPanel:
                     service_level = a1.slider(
                         "Nivel de servicio (z implícito)", 0.80, 0.99, step=0.01,
                         key=f"{self.k}service",
-                        value=float(st.session_state.get(f"{self.k}service", defaults["service"])),
+                        **_default_kw_for(f"{self.k}service", value=float(st.session_state.get(f"{self.k}service", defaults["service"]))),
                     )
                     order_up_factor = a2.number_input(
                         "Factor S (× μ_LT)", min_value=0.1, max_value=3.0, step=0.1,
                         key=f"{self.k}s_factor",
-                        value=float(st.session_state.get(f"{self.k}s_factor", defaults["s_factor"])),
+                        **_default_kw_for(f"{self.k}s_factor", value=float(st.session_state.get(f"{self.k}s_factor", defaults["s_factor"]))),
                     )
 
                 apply_btn = st.form_submit_button("Aplicar filtros", use_container_width=True)

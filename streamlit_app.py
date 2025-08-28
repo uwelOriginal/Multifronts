@@ -14,7 +14,28 @@ except Exception:
     _init_all = None
 
 # Núcleo y utilidades propias
-from core.load import load_data
+try:
+    from core.load import load_data  # layout antiguo
+except Exception:
+    # fallback mínimo (no se usa si existen los módulos reales)
+    def load_data():
+        DATA_DIR_loaded = DATA_DIR
+        def _read(name):
+            import pandas as pd
+            p = DATA_DIR_loaded / f"{name}.csv"
+            return pd.read_csv(p) if p.exists() else __import__("pandas").DataFrame()
+        stores     = _read("stores")
+        skus       = _read("skus")
+        sales      = _read("sales")
+        inv        = _read("inventory_levels")
+        lt         = _read("lead_time")
+        promos     = _read("promos")
+        distances  = _read("distances")
+        orders_c   = _read("orders")
+        transfers_c= _read("transfers")
+        notifications = _read("notifications")
+        return (DATA_DIR_loaded, stores, skus, sales, inv, lt, promos, distances, orders_c, transfers_c, notifications)
+    
 from core.headers import nice_headers
 from ui.kpis import kpi_cards
 from features.metrics import compute_baseline
@@ -79,6 +100,7 @@ def _slack_status(org_id: str) -> dict:
 def _slack_channel_info(org_id: str) -> dict:
     try:
         r = requests.get(f"{API_BASE}/debug/slack/channel_info", params={"org_id": org_id}, timeout=6)
+        print(org_id)
         return r.json()
     except Exception as e:
         return {"ok": False, "error": str(e)}

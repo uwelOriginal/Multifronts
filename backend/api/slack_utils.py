@@ -12,15 +12,14 @@ _client: httpx.Client | None = None
 def _httpx() -> httpx.Client:
     global _client
     if _client is None:
-        _client = httpx.Client(
-            timeout=8.0,
-            http2=True,
-            limits=httpx.Limits(
-                max_connections=int(os.getenv("HTTPX_MAX_CONN","20")),
-                max_keepalive_connections=int(os.getenv("HTTPX_KEEPALIVE","10")),
-                keepalive_expiry=60.0,
-            ),
-        )
+        try:
+            _client = httpx.Client(timeout=8.0, http2=True,
+                                   limits=httpx.Limits(max_connections=50, max_keepalive_connections=10))
+        except ImportError:
+            # Loggea un warning y baja a HTTP/1.1
+            # logger.warning("HTTP/2 not available; falling back to HTTP/1.1")
+            _client = httpx.Client(timeout=8.0, http2=False,
+                                   limits=httpx.Limits(max_connections=50, max_keepalive_connections=10))
     return _client
 
 def _slug_org(org_id: str) -> str:
