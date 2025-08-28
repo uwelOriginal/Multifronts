@@ -26,10 +26,13 @@ from services.accounts_repo import (
     get_user_by_email as db_get_user_by_email,
     create_user as db_create_user,
     upsert_org as db_upsert_org,
-    sync_org_maps_from_csv,   # <--- se mantiene
+    sync_org_maps_from_csv,
 )
 from services.repo import current_db_info
 from services.client_events import publish_event 
+
+from urllib.parse import quote as _urlquote
+import requests as _req
 
 EMAIL_RX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
@@ -180,8 +183,8 @@ def _hash(s: str) -> str:
 
 def _validate_reg_secret(secret: str) -> bool:
     cfg = (st.secrets.get("app", {}).get("registration_key") if hasattr(st, "secrets") else None) \
-          or os.getenv("REGISTRATION_KEY", "")
-    return bool(cfg) and (secret or "").strip() == cfg.strip()
+          or os.getenv("REGISTRATION_SECRET_HASH", "")
+    return bool(cfg) and _hash((secret or "").strip()) == cfg.strip()
 
 def _run_generator_register(email: str, password: str, org_name: str, stores: int = 2, sku_fraction: float = 0.35):
     # Intento 1: import directo
@@ -375,16 +378,25 @@ def login_ui(data_dir: Path):
     _safe_rerun()
 
 def _api_base() -> Optional[str]:
-    """Obtiene API_BASE de secrets o env, sin la barra final."""
+    """Obtiene la base del API desde secrets/env. Prioriza secrets['api']['base'] y luego 'API_BASE'. Quita la barra final."""
     try:
         if hasattr(st, "secrets"):
-            b = st.secrets.get("API_BASE", None)
-            if b:
-                return str(b).rstrip("/")
+            # 1) app-style: api: { base: ... }
+            api_dict = st.secrets.get("api", None)
+            if isinstance(api_dict, dict):
+                b = api_dict.get("base")
+                if b:
+                    return str(b).rstrip("/")
+            # 2) flat: API_BASE
+            b2 = st.secrets.get("API_BASE", None)
+            if b2:
+                return str(b2).rstrip("/")
     except Exception:
         pass
+    # 3) env var
     env_b = os.getenv("API_BASE", "").strip()
     return env_b.rstrip("/") if env_b else None
+
 
 def _valid_url(url: str | None) -> bool:
     return bool(url) and (str(url).startswith("http://") or str(url).startswith("https://"))
@@ -438,3 +450,72 @@ def resolve_org_webhook_oauth_first(orgs_df: pd.DataFrame | None, org_id: str) -
 
     # 3) Mapeo en orgs_df (CSV/DB)
     return resolve_org_webhook(orgs_df, org_id)
+
+# Resolver mail
+
+def _slug_org_for_channel(org_id: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9\-_]", "-", str(org_id).strip().lower())
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s[:70]
+
+def build_mailto_new_org(email: str | None, org_id: str | None) -> str | None:
+    """Genera un mailto con asunto/cuerpo prellenados, incluyendo:
+    - datos de cuenta/organización
+    - enlace de invitación al workspace (SLACK_WORKSPACE_INVITE_URL)
+    - enlace al canal de la organización (si existe)
+    """
+    try:
+        if not email or "@" not in email:
+            return None
+        org_id = (org_id or "").strip() or "(desconocida)"
+        api = _api_base()
+
+        # 1) Workspace invite (secrets/env)
+        invite_url = None
+        try:
+            if hasattr(st, "secrets"):
+                invite_url = st.secrets.get("SLACK_WORKSPACE_INVITE_URL", None)
+        except Exception:
+            pass
+        if not invite_url:
+            invite_url = os.getenv("SLACK_WORKSPACE_INVITE_URL", "").strip() or None
+
+        # 2) Canal de la organización: nombre + web_url (si ya existe)
+        chan_name = f"mf-{_slug_org_for_channel(org_id)}"
+        chan_url  = None
+        try:
+            if api:
+                r = _req.get(f"{api}/debug/slack/channel_info", params={"org_id": org_id}, timeout=4)
+                if r.ok:
+                    data = r.json() or {}
+                    if isinstance(data.get("channel_name"), str) and data.get("channel_name"):
+                        chan_name = data["channel_name"]
+                    cu = data.get("web_url")
+                    if isinstance(cu, str) and cu.startswith("http"):
+                        chan_url = cu
+        except Exception:
+            pass
+
+        subject = f"Bienvenido a Multifronts · Organización {org_id}"
+        lines = [
+            f"Hola {email},",
+            "",
+            f"Tu cuenta fue creada en Multifronts.",
+            f"Organización: {org_id}",
+            "",
+            "Enlaces de acceso a Slack:"
+        ]
+        if invite_url:
+            lines.append(f"• Invitación al workspace: {invite_url}")
+        else:
+            lines.append("• Invitación al workspace: (configura SLACK_WORKSPACE_INVITE_URL en el backend)")
+        if chan_url:
+            lines.append(f"• Canal de la organización #{chan_name}: {chan_url}")
+        else:
+            lines.append(f"• Canal de la organización #{chan_name}: (pendiente de creación o acceso)")
+        lines += ["", "— Equipo Multifronts"]
+
+        body = "\n".join(lines)
+        return f"mailto:{_urlquote(email)}?subject={_urlquote(subject)}&body={_urlquote(body)}"
+    except Exception:
+        return None

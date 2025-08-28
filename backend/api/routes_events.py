@@ -4,6 +4,7 @@ from .dbconn import engine
 from .db import insert_event, poll_events
 from .schemas import PublishIn, PollOut
 from .slack_utils import ensure_slack_tables, ensure_hq_channel, post_to_org
+import os
 
 router = APIRouter()
 
@@ -111,15 +112,24 @@ def events_publish(body: PublishIn):
             ensure_hq_channel(conn, org_id)
 
             if etype == "org_created":
-                # Mensaje de bienvenida (no es un movimiento)
-                post_to_org(
-                    conn, org_id,
-                    f"🆕 org_created — org `{org_id}`",
-                    [
-                        {"type":"section","text":{"type":"mrkdwn","text": f"*org_created* — org `{org_id}`"}},
-                        {"type":"section","text":{"type":"mrkdwn","text": "Canal HQ creado o verificado."}}
-                    ]
-                )
+                invite_url = os.getenv("SLACK_WORKSPACE_INVITE_URL", "").strip()
+                chan_name  = f"mf-{org_id}"  # nombre estándar de canal organizacional
+                created_by = (payload or {}).get("created_by") or "usuario"
+
+                # Construimos un mensaje claro con ambos enlaces (workspace y canal)
+                # Nota: el canal se muestra por nombre; Slack lo autoenlaza para miembros del workspace.
+                lines = [
+                    f"🆕 *Organización creada* — org `{org_id}`",
+                    f"Creado por: `{created_by}`",
+                ]
+                if invite_url:
+                    lines.append(f"Invitación al *workspace*: {invite_url}")
+                else:
+                    lines.append("_(Falta configurar SLACK_WORKSPACE_INVITE_URL en el backend)_")
+                lines.append(f"Canal de la organización: `#{chan_name}`")
+                text_msg = "\n".join(lines)
+
+                post_to_org(conn, org_id, text_msg, None)
             else:
                 # ---------- NUEVO: usar SIEMPRE build_text de slack_notify ----------
                 # Annotate filas con org/kind/actor para que build_text genere el título y líneas correctas
