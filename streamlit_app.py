@@ -1,4 +1,4 @@
-# streamlit_app.py (parchado)
+# streamlit_app.py
 import streamlit as st
 from pathlib import Path, PurePath
 import time, select, re, sys, os, requests
@@ -62,8 +62,31 @@ except Exception:
 import re, threading
 import queue as pyqueue
 
-# Para diagnosticar la base de datos
-# from services import diagnostics as dx
+# === NEW: helper para detectar historial en Neon ===
+from sqlalchemy import text
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _org_has_neon_history(org_id: str) -> bool:
+    """
+    Devuelve True si existen registros en orders_confirmed o transfers_confirmed para la org.
+    """
+    try:
+        eng = repo.get_engine()
+        with eng.begin() as conn:
+            val = conn.execute(
+                text("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM orders_confirmed WHERE org_id = :o
+                    ) OR EXISTS (
+                        SELECT 1 FROM transfers_confirmed WHERE org_id = :o
+                    ) AS has_hist
+                """),
+                {"o": str(org_id)}
+            ).scalar()
+        return bool(val)
+    except Exception:
+        # En caso de error de conexión, no bloquear el UI
+        return False
 
 # Config de página (evita re-renders raros)
 st.set_page_config(page_title="Multifronts", layout="wide", initial_sidebar_state="expanded")
@@ -83,7 +106,7 @@ API_BASE = (
 @st.cache_data(show_spinner=False, ttl=300)
 def _slack_workspace():
     try:
-        r = requests.get(f"{API_BASE}/slack/workspace", timeout=6)
+        r = requests.get(f"{API_BASE}/slack/workspace", timeout=10)
         return r.json()
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -91,7 +114,7 @@ def _slack_workspace():
 @st.cache_data(show_spinner=False, ttl=500)
 def _slack_status(org_id: str) -> dict:
     try:
-        r = requests.get(f"{API_BASE}/slack/status", params={"org_id": org_id}, timeout=6)
+        r = requests.get(f"{API_BASE}/slack/status", params={"org_id": org_id}, timeout=10)
         return r.json()
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -99,7 +122,7 @@ def _slack_status(org_id: str) -> dict:
 @st.cache_data(show_spinner=False, ttl=500)
 def _slack_channel_info(org_id: str) -> dict:
     try:
-        r = requests.get(f"{API_BASE}/debug/slack/channel_info", params={"org_id": org_id}, timeout=6)
+        r = requests.get(f"{API_BASE}/debug/slack/channel_info", params={"org_id": org_id}, timeout=10)
         print(org_id)
         return r.json()
     except Exception as e:
@@ -128,7 +151,7 @@ def navbar(available_summary: bool) -> tuple[str, str]:
     mode = st.sidebar.radio("Modo", ["Simplificado", "Técnico"], index=1, key="nav_mode")
     items = ["Operación"]
     if available_summary:
-        items.append("Resumen 4.5")
+        items.append("Reporte")
     section = st.sidebar.radio("Sección", items, index=0, key="nav_section")
     return mode, section
 
@@ -136,11 +159,9 @@ def main():
     st.title("🧭 MULTI FRONTS")
 
     # ---- Login/Registro en sidebar (formularios) ----
-    # NO cargar datos pesados hasta tener sesión.
     user, orgs_df = login_ui(DATA_DIR)
     actor = get_current_user()
     if not actor:
-        # Si no hay sesión, muestra registro también (no bloquea; es form)
         try:
             register_ui(DATA_DIR)
         except Exception:
@@ -163,6 +184,19 @@ def main():
         st.error("Tu organización aún no tiene tiendas y/o SKUs asignados. Contacta al administrador.")
         st.stop()
 
+    # ⤵️ Si Neon aún no tiene inventario para esta org, siembra desde el snapshot CSV
+    try:
+        inv_db_check = repo.fetch_inventory_levels(
+            org_id=actor.org_id,
+            store_ids=list(allowed_stores),
+            sku_ids=list(allowed_skus),
+        )
+        if inv_db_check is None or inv_db_check.empty:
+            if inv is not None and not inv.empty:
+                repo.seed_inventory_from_snapshot(actor.org_id, inv)
+    except Exception as _e:
+        st.info(f"(info) No se pudo inicializar inventario en Neon: {_e}")
+
     # Catálogos/ventas scopeados
     stores_scoped = stores[stores["store_id"].isin(sorted(allowed_stores))].copy()
     skus_scoped   = skus[skus["sku_id"].isin(sorted(allowed_skus))].copy()
@@ -177,7 +211,11 @@ def main():
     # ¿Hay movimientos previos o de esta sesión?
     has_past_moves = (orders_c is not None and not orders_c.empty) or (transfers_c is not None and not transfers_c.empty)
     has_session_moves = st.session_state.get("movements_this_session", False)
-    available_summary = has_past_moves or has_session_moves
+
+    # === NEW: considerar historial en Neon ===
+    has_neon_history = _org_has_neon_history(actor.org_id)
+
+    available_summary = has_past_moves or has_session_moves or has_neon_history
 
     mode, section = navbar(available_summary=available_summary)
 
@@ -243,12 +281,10 @@ def main():
         team_id = (ws or {}).get("team_id")
 
         if invite_url:
-            # Si tu versión de Streamlit soporta st.link_button, úsalo. Si no, usa st.markdown.
             try:
                 st.link_button("Entrar al Slack (workspace)", invite_url, use_container_width=True)
             except Exception:
                 st.markdown(f"[Entrar al Slack (workspace)]({invite_url})")
-
             st.caption(
                 "Primero únete al workspace con el botón de arriba. "
                 "Luego podrás invitarte o unirte al canal de tu organización desde el bloque de Slack más abajo."
@@ -270,21 +306,13 @@ def main():
             st.info("Inicia sesión para ver tu canal de Slack.")
         else:
             st.caption("Canal asignado por organización (se crea automáticamente).")
-
             info = _slack_channel_info(org_id)
             status = _slack_status(org_id)
 
-            # 1) Enlace "técnico" solicitado (JSON con web_url etc.)
-            #st.markdown(
-            #    f"[Ver detalles del canal]({API_BASE}/debug/slack/channel_info?org_id={org_id})"
-            #)
-
-            # 2) Enlace directo a Slack si está disponible
             web_url = (info or {}).get("web_url")
             if web_url:
                 st.markdown(f"[Abrir canal de Slack]({web_url})")
 
-            # 3) Mostrar estado y permitir auto-invitación
             if not (info or {}).get("ok"):
                 st.warning("Aún no hay canal registrado o falta autorización del bot.")
             else:
@@ -311,10 +339,9 @@ def main():
         elif psycopg is None:
             st.sidebar.warning("psycopg no está instalado. Ejecuta: pip install 'psycopg[binary]'")
         else:
-            # 1) Listener compartido (persistente) mediante cache_resource
             @st.cache_resource(show_spinner=False)
             def get_pg_listener(db_url: str, channel_name: str):
-                url = db_url.replace("+psycopg", "")  # psycopg no entiende el sufijo de SQLAlchemy
+                url = db_url.replace("+psycopg", "")
                 q: "pyqueue.Queue[str]" = pyqueue.Queue()
                 stop_evt = threading.Event()
 
@@ -335,7 +362,6 @@ def main():
                                         except Exception:
                                             pass
                     except Exception:
-                        # Si hay un error aquí, el queue sigue existiendo; evitamos romper la app
                         pass
 
                 th = threading.Thread(target=_run, name="pg-listener", daemon=True)
@@ -343,9 +369,6 @@ def main():
                 return q, stop_evt
 
             chan = "org_events_" + re.sub(r"[^a-zA-Z0-9_]", "_", str(ctx.org_id))
-            q, stop_evt = get_pg_listener(repo.DB_URL, chan)
-
-            drained = False
             try:
                 q, stop_evt = get_pg_listener(repo.DB_URL, chan)
             except Exception:
@@ -365,7 +388,7 @@ def main():
                     render_views_in()
 
             with st.sidebar.expander("Modo escucha puntual", expanded=False):
-                secs = st.number_input("Segundos", min_value=5, max_value=120, value=20, step=5)
+                secs = st.number_input("Segundos", min_value=1, max_value=10, value=3, step=1)
                 if st.button("👂 Escuchar ahora"):
                     import time
                     deadline = time.time() + float(secs)

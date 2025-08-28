@@ -101,6 +101,48 @@ BEGIN
   END IF;
 END$$;
 
+-- Pedidos confirmados (idempotentes por idem_key)
+CREATE TABLE IF NOT EXISTS orders_confirmed (
+  id           SERIAL PRIMARY KEY,
+  org_id       TEXT NOT NULL,
+  store_id     TEXT NOT NULL,
+  sku_id       TEXT NOT NULL,
+  qty          NUMERIC NOT NULL,
+  approved_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  approved_by  TEXT,
+  idem_key     TEXT NOT NULL,
+  CONSTRAINT uq_orders_idem UNIQUE (org_id, store_id, sku_id, idem_key)
+);
+
+-- Transferencias confirmadas (idempotentes por idem_key)
+CREATE TABLE IF NOT EXISTS transfers_confirmed (
+  id           SERIAL PRIMARY KEY,
+  org_id       TEXT NOT NULL,
+  from_store   TEXT NOT NULL,
+  to_store     TEXT NOT NULL,
+  sku_id       TEXT NOT NULL,
+  qty          NUMERIC NOT NULL,
+  approved_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  approved_by  TEXT,
+  idem_key     TEXT NOT NULL,
+  CONSTRAINT uq_transfers_idem UNIQUE (org_id, from_store, to_store, sku_id, idem_key)
+);
+
+-- Inventario vivo por Org–Sucursal–SKU
+CREATE TABLE IF NOT EXISTS inventory_levels (
+  id         SERIAL PRIMARY KEY,
+  org_id     TEXT NOT NULL,
+  store_id   TEXT NOT NULL,
+  sku_id     TEXT NOT NULL,
+  on_hand    NUMERIC NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_inventory_key UNIQUE (org_id, store_id, sku_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_orders_org   ON orders_confirmed(org_id);
+CREATE INDEX IF NOT EXISTS ix_transfers_org ON transfers_confirmed(org_id);
+CREATE INDEX IF NOT EXISTS ix_inv_org      ON inventory_levels(org_id);
+
 SELECT current_database(), current_user, now();
 SELECT COUNT(*) FROM users;
 SELECT COUNT(*) FROM org_store_map;

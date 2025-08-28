@@ -9,6 +9,5 @@ requests
 uvicorn[standard]
 SQLAlchemy>=2.0
 psycopg[binary]
-redis
 python-dotenv
 httpx

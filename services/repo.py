@@ -9,7 +9,7 @@ from urllib.parse import quote_plus, urlparse
 import pandas as pd
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String, DateTime, Numeric,
-    UniqueConstraint, insert, select
+    UniqueConstraint, insert, select, text
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
@@ -166,6 +166,10 @@ def ensure_movements_schema() -> None:
 def _now_utc() -> _dt.datetime:
     return _dt.datetime.utcnow()
 
+# ==============================
+# Semilla / Lectura de Inventario
+# ==============================
+
 def seed_inventory_from_snapshot(
     org_id: str,
     snapshot_df: pd.DataFrame,
@@ -173,33 +177,30 @@ def seed_inventory_from_snapshot(
     sku_col: str = "sku_id",
     on_hand_col: str = "on_hand_units",
 ) -> int:
+    """
+    Llena inventory_levels con el snapshot inicial de la org (idempotente por clave única).
+    Usa SQLAlchemy text() para que los binds :param funcionen en psycopg3.
+    """
     ensure_movements_schema()
     if snapshot_df is None or snapshot_df.empty:
         return 0
+
     df = snapshot_df[[store_col, sku_col, on_hand_col]].copy()
     df = df.rename(columns={store_col: "store_id", sku_col: "sku_id", on_hand_col: "on_hand"})
     df["org_id"] = org_id
-    df["updated_at"] = _now_utc()
+    ts = _now_utc()
+    df["updated_at"] = ts
 
-    affected = 0
+    sql = text("""
+        INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
+        VALUES (:org_id, :store_id, :sku_id, :on_hand, :updated_at)
+        ON CONFLICT (org_id, store_id, sku_id)
+        DO UPDATE SET on_hand = EXCLUDED.on_hand,
+                      updated_at = :updated_at;
+    """)
     with engine.begin() as conn:
-        if engine.dialect.name == "postgresql":
-            sql = """
-            INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
-            VALUES (:org_id, :store_id, :sku_id, :on_hand, :updated_at)
-            ON CONFLICT (org_id, store_id, sku_id)
-            DO UPDATE SET on_hand = EXCLUDED.on_hand, updated_at = EXCLUDED.updated_at;
-            """
-        else:
-            sql = """
-            INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
-            VALUES (:org_id, :store_id, :sku_id, :on_hand, :updated_at)
-            ON CONFLICT(org_id, store_id, sku_id)
-            DO UPDATE SET on_hand = excluded.on_hand, updated_at = excluded.updated_at;
-            """
-        conn.exec_driver_sql(sql, df.to_dict(orient="records"))
-        affected = len(df)
-    return affected
+        conn.execute(sql, df.to_dict(orient="records"))
+    return len(df)
 
 def fetch_inventory_levels(
     org_id: str,
@@ -226,9 +227,27 @@ def fetch_inventory_levels(
         df = pd.read_sql(stmt, conn)
     return df
 
+# ===================
+# Guardado de pedidos
+# ===================
+
 def save_orders(*, org_id: str, rows: List[Dict], approved_by: str, idem_prefix: str) -> tuple[int, int]:
+    """
+    Inserta órdenes confirmadas y AUMENTA inventario en Neon (idempotente por idem_key).
+    - Si la orden ya existe (duplicada), NO vuelve a sumar inventario.
+    """
     ensure_movements_schema()
     nuevos, duplicados = 0, 0
+    ts = _now_utc()
+
+    upsert_inv = text("""
+        INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
+        VALUES (:org_id, :store_id, :sku_id, :delta, :ts)
+        ON CONFLICT (org_id, store_id, sku_id)
+        DO UPDATE SET on_hand = inventory_levels.on_hand + EXCLUDED.on_hand,
+                      updated_at = :ts;
+    """)
+
     with engine.begin() as conn:
         for r in rows:
             qty = r.get("qty", 0)
@@ -240,50 +259,73 @@ def save_orders(*, org_id: str, rows: List[Dict], approved_by: str, idem_prefix:
                 continue
             if qty <= 0:
                 continue
+
+            store_id = str(r["store_id"])
+            sku_id   = str(r["sku_id"])
+
             payload = {
                 "org_id": org_id,
-                "store_id": str(r["store_id"]),
-                "sku_id": str(r["sku_id"]),
+                "store_id": store_id,
+                "sku_id": sku_id,
                 "qty": qty,
-                "approved_at": _now_utc(),
+                "approved_at": ts,
                 "approved_by": approved_by,
-                "idem_key": f"{idem_prefix}:order:{r['store_id']}:{r['sku_id']}",
+                "idem_key": f"{idem_prefix}:order:{store_id}:{sku_id}",
             }
+
+            # 1) Inserta la orden (idempotente)
             try:
                 conn.execute(insert(orders_tbl), [payload])
-                nuevos += 1
             except IntegrityError:
                 duplicados += 1
+                continue
+
+            # 2) Upsert de inventario: on_hand += qty
+            conn.execute(
+                upsert_inv,
+                {"org_id": org_id, "store_id": store_id, "sku_id": sku_id, "delta": qty, "ts": ts},
+            )
+            nuevos += 1
+
     return nuevos, duplicados
+
+# ========================
+# Guardado de transferencias
+# ========================
 
 def save_transfers(
     *, org_id: str, rows: List[Dict], approved_by: str, idem_prefix: str
 ) -> tuple[int, int, int]:
+    """
+    Inserta transferencias confirmadas y MUEVE inventario A→B (idempotente por idem_key).
+    - Descuenta del origen solo si hay stock suficiente.
+    - Si hay duplicado, no vuelve a aplicar.
+    """
     ensure_movements_schema()
     applied, dup, insufficient = 0, 0, 0
-    dialect = engine.dialect.name
+    ts = _now_utc()
+
+    ensure_key_sql = text("""
+        INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
+        VALUES (:org_id, :store_id, :sku_id, 0, :ts)
+        ON CONFLICT (org_id, store_id, sku_id) DO NOTHING;
+    """)
+
+    deduct_sql = text("""
+        UPDATE inventory_levels
+           SET on_hand = on_hand - :q, updated_at = :ts
+         WHERE org_id = :org_id AND store_id = :store_id AND sku_id = :sku_id AND on_hand >= :q;
+    """)
+
+    add_sql = text("""
+        INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
+        VALUES (:org_id, :store_id, :sku_id, :q, :ts)
+        ON CONFLICT (org_id, store_id, sku_id)
+        DO UPDATE SET on_hand = inventory_levels.on_hand + EXCLUDED.on_hand,
+                      updated_at = :ts;
+    """)
 
     with engine.begin() as conn:
-        def _ensure_key(store_id: str, sku_id: str) -> None:
-            if dialect == "postgresql":
-                conn.exec_driver_sql(
-                    """
-                    INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
-                    VALUES (:org_id, :store_id, :sku_id, 0, NOW())
-                    ON CONFLICT (org_id, store_id, sku_id) DO NOTHING;
-                    """,
-                    {"org_id": org_id, "store_id": str(store_id), "sku_id": str(sku_id)},
-                )
-            else:
-                conn.exec_driver_sql(
-                    """
-                    INSERT INTO inventory_levels (org_id, store_id, sku_id, on_hand, updated_at)
-                    VALUES (:org_id, :store_id, :sku_id, 0, CURRENT_TIMESTAMP)
-                    ON CONFLICT(org_id, store_id, sku_id) DO NOTHING;
-                    """,
-                    {"org_id": org_id, "store_id": str(store_id), "sku_id": str(sku_id)},
-                )
-
         for r in rows:
             qty = r.get("qty", 0)
             if qty is None:
@@ -308,40 +350,34 @@ def save_transfers(
                 "to_store": to_store,
                 "sku_id": sku_id,
                 "qty": qty,
-                "approved_at": _now_utc(),
+                "approved_at": ts,
                 "approved_by": approved_by,
                 "idem_key": f"{idem_prefix}:transfer:{from_store}:{to_store}:{sku_id}",
             }
+
             try:
                 conn.execute(insert(transfers_tbl), [payload])
             except IntegrityError:
                 dup += 1
                 continue
 
-            _ensure_key(from_store, sku_id)
-            _ensure_key(to_store, sku_id)
+            # Garantiza claves A y B
+            conn.execute(ensure_key_sql, {"org_id": org_id, "store_id": from_store, "sku_id": sku_id, "ts": ts})
+            conn.execute(ensure_key_sql, {"org_id": org_id, "store_id": to_store,   "sku_id": sku_id, "ts": ts})
 
-            res = conn.exec_driver_sql(
-                """
-                UPDATE inventory_levels
-                   SET on_hand = on_hand - :q, updated_at = NOW()
-                 WHERE org_id=:o AND store_id=:s AND sku_id=:k AND on_hand >= :q
-                """,
-                {"o": org_id, "s": from_store, "k": sku_id, "q": qty},
+            # Descuenta en origen (si hay suficiente)
+            res = conn.execute(
+                deduct_sql,
+                {"org_id": org_id, "store_id": from_store, "sku_id": sku_id, "q": qty, "ts": ts},
             )
-            if res.rowcount == 0:
+            if getattr(res, "rowcount", 0) == 0:
                 insufficient += 1
                 continue
 
-            conn.exec_driver_sql(
-                """
-                INSERT INTO inventory_levels(org_id, store_id, sku_id, on_hand, updated_at)
-                VALUES (:o, :s, :k, :q, NOW())
-                ON CONFLICT (org_id, store_id, sku_id)
-                DO UPDATE SET on_hand = inventory_levels.on_hand + EXCLUDED.on_hand,
-                              updated_at = NOW();
-                """,
-                {"o": org_id, "s": to_store, "k": sku_id, "q": qty},
+            # Suma en destino
+            conn.execute(
+                add_sql,
+                {"org_id": org_id, "store_id": to_store, "sku_id": sku_id, "q": qty, "ts": ts},
             )
             applied += 1
 

@@ -18,7 +18,7 @@ def slack_status(org_id: str) -> dict:
     if not base:
         return {"connected": False, "error": "API_BASE no configurado"}
     try:
-        r = requests.get(f"{base}/slack/status", params={"org_id": org_id}, timeout=5)
+        r = requests.get(f"{base}/slack/status", params={"org_id": org_id}, timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as e:

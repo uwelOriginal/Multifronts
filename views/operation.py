@@ -28,6 +28,9 @@ from optimizer import suggest_transfers
 from services import repo
 from services.client_events import publish_event
 
+# NEW: logging opcional de notificaciones a CSV (no-op en cloud si MULTIFRONTS_DISABLE_LOCAL_IO=1)
+from notifier import log_notifications  # <- archivo raíz
+
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -40,6 +43,8 @@ class OperationView(BaseView):
 
     # ----- Secciones -----
     def _risks_by_store(self, enriched: pd.DataFrame):
+        if self.mode != "Técnico":
+            return
         st.subheader("Riesgos por Sucursal")
         agg_store = pd.DataFrame(columns=["Sucursal", "Riesgo de quiebre", "Sobrestock", "Baja demanda", "Normal"])
         if not enriched.empty:
@@ -60,7 +65,7 @@ class OperationView(BaseView):
         st.subheader("Top riesgos (Riesgo de quiebre)")
         top_risk = enriched[enriched["risk"] == "Riesgo de quiebre"].copy()
         if top_risk.empty:
-            st.info("Sin riesgos de quiebre bajo los filtros seleccionados.")
+            st.info("No hay riesgos de quiebre bajo los filtros seleccionados.")
             return
         top_risk["doc"] = np.round(top_risk["days_of_cover"], 1)
         top_risk = top_risk.sort_values(["doc"]).head(50)
@@ -146,10 +151,30 @@ class OperationView(BaseView):
                         "count_dup": int(duplicados),
                         "rows": rows_db,
                     },
-                    timeout=3.0,
+                    timeout=10.0,
                 )
             except Exception as e:
                 st.warning(f"No se pudo publicar evento en backend: {e}")
+
+            # Logging opcional local
+            try:
+                log_notifications(
+                    records=[
+                        {
+                            "kind": "order",
+                            "org_id": self.ctx.org_id,
+                            "actor": self.ctx.actor_email,
+                            "ts_iso": _now_utc_iso(),
+                            "store_id": r["store_id"],
+                            "sku_id": r["sku_id"],
+                            "qty": r["qty"],
+                            "message": "Pedido sugerido aprobado",
+                        } for r in rows_db
+                    ],
+                    path=self.ctx.DATA_DIR / "notifications.csv",
+                )
+            except Exception:
+                pass
 
             st.session_state["movements_this_session"] = True
             st.success(f"Órdenes guardadas en BD: {nuevos} nuevas, {duplicados} duplicadas (omitidas).")
@@ -235,13 +260,175 @@ class OperationView(BaseView):
                         "count_insufficient": int(insuficientes),
                         "rows": rows_db_t,
                     },
-                    timeout=3.0,
+                    timeout=10.0,
                 )
             except Exception as e:
                 st.warning(f"No se pudo publicar evento en backend: {e}")
 
+            # Logging opcional local
+            try:
+                log_notifications(
+                    records=[
+                        {
+                            "kind": "transfer",
+                            "org_id": self.ctx.org_id,
+                            "actor": self.ctx.actor_email,
+                            "ts_iso": _now_utc_iso(),
+                            "from_store": r["from_store"],
+                            "to_store": r["to_store"],
+                            "sku_id": r["sku_id"],
+                            "qty": r["qty"],
+                            "message": "Transferencia sugerida aprobada",
+                        } for r in rows_db_t
+                    ],
+                    path=self.ctx.DATA_DIR / "notifications.csv",
+                )
+            except Exception:
+                pass
+
             st.session_state["movements_this_session"] = True
             st.success(f"Transferencias aplicadas: {aplicadas} | duplicadas: {duplicadas} | sin stock: {insuficientes}")
+
+    def _manual_orders(self, enriched: pd.DataFrame):
+        st.subheader("📦 Pedido manual")
+        c1, c2, c3 = st.columns(3)
+        sku_opts   = sorted(self.ctx.skus["sku_id"].unique().tolist())
+        store_opts = sorted(self.ctx.stores["store_id"].unique().tolist())
+
+        with st.form("manual_order"):
+            sku_pick   = c1.selectbox("SKU", sku_opts, key="mo_sku")
+            store_pick = c2.selectbox("Sucursal", store_opts, key="mo_store",
+                                    format_func=lambda s: self.ctx.id_to_label.get(s, s))
+            qty        = c3.number_input("Unidades", min_value=1, step=1, value=1, key="mo_qty")
+            approve    = st.form_submit_button("Aprobar pedido")
+
+        if approve:
+            rows = [{"store_id": store_pick, "sku_id": sku_pick, "qty": int(qty)}]
+            idem = f"{self.ctx.org_id}:{self.ctx.actor_email}:{int(time.time())}"
+            nuevos, dups = repo.save_orders(
+                org_id=self.ctx.org_id, rows=rows,
+                approved_by=self.ctx.actor_email, idem_prefix=idem
+            )
+
+            # NEW: Slack webhook (igual que sugeridos) + logging CSV
+            payload_df = pd.DataFrame([{
+                "kind": "order.manual",
+                "org_id": self.ctx.org_id,
+                "actor": self.ctx.actor_email,
+                "ts_iso": _now_utc_iso(),
+                "store_id": store_pick,
+                "sku_id": sku_pick,
+                "qty": int(qty),
+            }])
+
+            webhook = resolve_org_webhook_oauth_first(
+                load_account_tables(self.ctx.DATA_DIR)[1],
+                self.ctx.org_id
+            )
+            if webhook:
+                ok, msg = send_slack_notifications(payload_df, webhook)
+                st.toast(msg, icon="✅" if ok else "⚠️")
+            else:
+                st.toast("No hay Slack webhook configurado (org o env).", icon="⚠️")
+
+            try:
+                log_notifications(
+                    records=[{
+                        "kind": "order.manual",
+                        "org_id": self.ctx.org_id,
+                        "actor": self.ctx.actor_email,
+                        "ts_iso": _now_utc_iso(),
+                        "store_id": store_pick,
+                        "sku_id": sku_pick,
+                        "qty": int(qty),
+                        "message": "Pedido manual aprobado",
+                    }],
+                    path=self.ctx.DATA_DIR / "notifications.csv",
+                )
+            except Exception:
+                pass
+
+            try:
+                publish_event(self.ctx.org_id, "order_manual_approved", {"rows": rows, "count_new": int(nuevos)}, 3.0)
+            except Exception as e:
+                st.warning(f"No se pudo publicar evento: {e}")
+
+            st.toast(f"Pedido aprobado. Nuevos: {nuevos} Duplicados: {dups}", icon="✅")
+            st.session_state["movements_this_session"] = True
+
+    def _manual_transfers(self, enriched: pd.DataFrame):
+        st.subheader("🔁 Transferencia manual")
+        c1, c2, c3, c4 = st.columns(4)
+        sku_opts   = sorted(self.ctx.skus["sku_id"].unique().tolist())
+        store_opts = sorted(self.ctx.stores["store_id"].unique().tolist())
+
+        with st.form("manual_transfer"):
+            sku_pick   = c1.selectbox("SKU", sku_opts, key="mt_sku")
+            from_pick  = c2.selectbox("Desde", store_opts, key="mt_from",
+                                    format_func=lambda s: self.ctx.id_to_label.get(s, s))
+            to_pick    = c3.selectbox("Hacia", [s for s in store_opts if s != from_pick],
+                                    key="mt_to", format_func=lambda s: self.ctx.id_to_label.get(s, s))
+            qty        = c4.number_input("Unidades", min_value=1, step=1, value=1, key="mt_qty")
+            approve    = st.form_submit_button("Aprobar transferencia")
+
+        if approve:
+            rows = [{"from_store": from_pick, "to_store": to_pick, "sku_id": sku_pick, "qty": int(qty)}]
+            idem = f"{self.ctx.org_id}:{self.ctx.actor_email}:{int(time.time())}"
+            applied, dups, insufficient = repo.save_transfers(
+                org_id=self.ctx.org_id, rows=rows,
+                approved_by=self.ctx.actor_email, idem_prefix=idem
+            )
+
+            # NEW: Slack webhook (igual que sugeridos) + logging CSV
+            payload_df = pd.DataFrame([{
+                "kind": "transfer.manual",
+                "org_id": self.ctx.org_id,
+                "actor": self.ctx.actor_email,
+                "ts_iso": _now_utc_iso(),
+                "from_store": from_pick,
+                "to_store": to_pick,
+                "sku_id": sku_pick,
+                "qty": int(qty),
+            }])
+
+            webhook = resolve_org_webhook_oauth_first(
+                load_account_tables(self.ctx.DATA_DIR)[1],
+                self.ctx.org_id
+            )
+            if webhook:
+                ok, msg = send_slack_notifications(payload_df, webhook)
+                st.toast(msg, icon="✅" if ok else "⚠️")
+            else:
+                st.toast("No hay Slack webhook configurado (org o env).", icon="⚠️")
+
+            try:
+                log_notifications(
+                    records=[{
+                        "kind": "transfer.manual",
+                        "org_id": self.ctx.org_id,
+                        "actor": self.ctx.actor_email,
+                        "ts_iso": _now_utc_iso(),
+                        "from_store": from_pick,
+                        "to_store": to_pick,
+                        "sku_id": sku_pick,
+                        "qty": int(qty),
+                        "message": "Transferencia manual aprobada",
+                    }],
+                    path=self.ctx.DATA_DIR / "notifications.csv",
+                )
+            except Exception:
+                pass
+
+            try:
+                publish_event(self.ctx.org_id, "transfer_manual_approved", {"rows": rows, "count_applied": int(applied), "count_insufficient": int(insufficient)}, 3.0)
+            except Exception as e:
+                st.warning(f"No se pudo publicar evento: {e}")
+
+            if applied:
+                st.toast(f"Transferencia aplicada: {applied}", icon="✅")
+            if insufficient:
+                st.toast(f"Insuficientes (sin stock en origen): {insufficient}", icon="⚠️")
+            st.session_state["movements_this_session"] = True
 
     def _detail(self, enriched: pd.DataFrame):
         if self.mode != "Técnico":
@@ -301,7 +488,7 @@ class OperationView(BaseView):
             st.warning("⚠️ No hay SKUs después de aplicar filtros de categoría/ABC.")
             return
 
-        # 2) Sustituir inventario por estado vivo en BD si existe (menor latencia + consistencia)
+        # 2) Sustituir inventario por estado vivo en BD si existe
         try:
             db_inv = repo.fetch_inventory_levels(
                 org_id=self.ctx.org_id,
@@ -329,5 +516,11 @@ class OperationView(BaseView):
             self._orders(enriched)
         with col2:
             self._transfers(enriched)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            self._manual_orders(enriched)
+        with col2:
+            self._manual_transfers(enriched)
 
         self._detail(enriched)

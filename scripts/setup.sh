@@ -12,6 +12,6 @@ mkdir -p data scripts
 
 # 3) verificación de archivos clave
 echo "[setup] Variables de entorno:"
-grep -E '^(DATABASE_URL|REDIS_URL|API_BASE|SLACK_WEBHOOK_URL)=' .env || true
+grep -E '^(DATABASE_URL|API_BASE|SLACK_WEBHOOK_URL)=' .env || true
 
 echo "[setup] Listo. Puedes ejecutar:  docker compose up -d --build"

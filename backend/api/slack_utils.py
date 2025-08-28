@@ -175,28 +175,47 @@ def ensure_hq_channel(conn, org_id: str) -> Optional[str]:
     return res["channel_id"] if res.get("ok") and res.get("channel_id") else None
 
 def post_to_org(conn, org_id: str, message: str, blocks: Optional[list]=None) -> bool:
+    """
+    PRIORIDAD:
+      1) Canal HQ (mf-{org}) con SLACK_HQ_BOT_TOKEN.
+      2) Bot de la instalación + default_channel_id.
+      3) Fallback: incoming_webhook_url (puede ser canal personal).
+    """
     ensure_slack_tables(conn)
     inst = get_installation(conn, org_id)
 
-    if inst and inst.get("incoming_webhook_url"):
-        r = _httpx().post(inst["incoming_webhook_url"], json={"text": message, **({"blocks": blocks} if blocks else {})})
-        return r.status_code < 300
+    # 1) Canal HQ con token HQ (crea/verifica si no existe)
+    cid = ensure_hq_channel(conn, org_id)
+    if cid and SLACK_HQ_BOT_TOKEN:
+        headers = {"Authorization": f"Bearer {SLACK_HQ_BOT_TOKEN}"}
+        d = _httpx().post(
+            f"{SLACK_API}/chat.postMessage",
+            headers=headers,
+            json={"channel": cid, "text": message, **({"blocks": blocks} if blocks else {})}
+        ).json()
+        if d.get("ok"):
+            return True
 
+    # 2) Bot de la instalación (si viene con canal por defecto)
     if inst and inst.get("bot_token") and inst.get("default_channel_id"):
         headers = {"Authorization": f"Bearer {inst['bot_token']}"}
-        d = _httpx().post(f"{SLACK_API}/chat.postMessage",
-                          headers=headers,
-                          json={"channel": inst["default_channel_id"], "text": message, **({"blocks": blocks} if blocks else {})}).json()
-        return bool(d.get("ok", False))
+        d = _httpx().post(
+            f"{SLACK_API}/chat.postMessage",
+            headers=headers,
+            json={"channel": inst["default_channel_id"], "text": message, **({"blocks": blocks} if blocks else {})}
+        ).json()
+        if d.get("ok"):
+            return True
 
-    cid = ensure_hq_channel(conn, org_id)
-    if not cid or not SLACK_HQ_BOT_TOKEN:
-        return False
-    headers = {"Authorization": f"Bearer {SLACK_HQ_BOT_TOKEN}"}
-    d = _httpx().post(f"{SLACK_API}/chat.postMessage",
-                      headers=headers,
-                      json={"channel": cid, "text": message, **({"blocks": blocks} if blocks else {})}).json()
-    return bool(d.get("ok", False))
+    # 3) Último recurso: webhook (puede apuntar a canal personal)
+    if inst and inst.get("incoming_webhook_url"):
+        r = _httpx().post(
+            inst["incoming_webhook_url"],
+            json={"text": message, **({"blocks": blocks} if blocks else {})}
+        )
+        return r.status_code < 300
+
+    return False
 
 # --------- Diagnóstico extra ---------
 def get_channel_info(channel_id: str) -> Dict[str, Any]:
