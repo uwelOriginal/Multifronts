@@ -5,6 +5,7 @@ import os
 import math
 import requests
 from typing import Iterable, Union
+from backend.api.routes_events import _build_text
 
 # (Opcional) pandas para detectar DataFrame en runtime
 try:
@@ -30,73 +31,6 @@ def _is_nan_like(v: object) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("", "nan", "none", "null")
     return False
-
-# Estos 2 se siguen usando para el Fallback (webhook)
-def _as_int(x: object) -> int:
-    try:
-        return int(float(x))
-    except Exception:
-        return 0
-
-def _fmt_line(row: dict) -> str:
-    kind = str(row.get("kind", "")).lower()
-    actor = row.get("actor") or "usuario"
-    sku = row.get("sku_id")
-    qty = _as_int(row.get("qty", 0))
-
-    if kind.startswith("order"):
-        store = row.get("store_id")
-        return f"- {actor} aprobó *PEDIDO* • SKU `{sku}` → Sucursal `{store}` • +{qty} uds"
-
-    if kind.startswith("transfer"):
-        from_store = row.get("from_store")
-        to_store = row.get("to_store")
-        return f"- {actor} aprobó *TRANSFERENCIA* • SKU `{sku}` • `{from_store}` → `{to_store}` • {qty} uds"
-
-    target = row.get("store_id") or f"{row.get('from_store')}→{row.get('to_store')}"
-    return f"- {actor} aprobó *MOVIMIENTO* • SKU `{sku}` • {target} • {qty} uds"
-
-def _build_text(payload) -> str:
-    """Texto estilo 'manual' (solo para fallback al webhook)."""
-    if _pd is not None and isinstance(payload, _pd.DataFrame) and not payload.empty:
-        first = payload.iloc[0]
-        header_kind = str(first.get("kind", "")).lower()
-        title = "📦 Pedidos aprobados" if header_kind.startswith("order") \
-            else "🔁 Transferencias aprobadas" if header_kind.startswith("transfer") \
-            else "✅ Movimientos aprobados"
-        org = None
-        if "org_id" in payload.columns:
-            try:
-                cand = payload["org_id"].iloc[0]
-                if isinstance(cand, str) and cand.strip():
-                    org = cand.strip()
-            except Exception:
-                pass
-        lines = [title + (f" · org `{org}`" if org else "")]
-        for _, r in payload.fillna("").iterrows():
-            lines.append(_fmt_line(dict(r)))
-        return "\n".join(lines[:30])
-
-    if isinstance(payload, dict):
-        return _fmt_line(payload)
-
-    try:
-        it = list(payload)
-        if not it:
-            return "Aprobados: movimientos registrados."
-        header_kind = str(it[0].get("kind", "")).lower() if isinstance(it[0], dict) else ""
-        title = "📦 Pedidos aprobados" if header_kind.startswith("order") \
-            else "🔁 Transferencias aprobadas" if header_kind.startswith("transfer") \
-            else "✅ Movimientos aprobados"
-        lines = [title]
-        lines += [_fmt_line(r) for r in it[:30]]
-        return "\n".join(lines)
-    except Exception:
-        try:
-            n = len(list(payload))
-        except Exception:
-            n = 1
-        return f"Aprobados: {n} movimiento(s)."
 
 # ----------------------------
 # NUEVO: misma vía que diagnóstico
