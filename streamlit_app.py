@@ -1,11 +1,20 @@
 # streamlit_app.py
 import streamlit as st
-from pathlib import Path, PurePath
+import pathlib
 import time, select, re, sys, os, requests
 
-ROOT = Path(__file__).resolve().parent
+ROOT = pathlib.Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# --- Import bootstrap: asegura que 'multifronts/' quede en sys.path ---
+_THIS_FILE = pathlib.Path(__file__).resolve()
+_PKG_ROOT  = _THIS_FILE.parent            # /mount/src/multifronts
+_REPO_ROOT = _PKG_ROOT.parent             # /mount/src
+for p in (str(_PKG_ROOT), str(_REPO_ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+# ---------------------------------------------------------------------
 
 # Instanciar data csv
 try:
@@ -93,7 +102,7 @@ st.set_page_config(page_title="Multifronts", layout="wide", initial_sidebar_stat
 
 # === RUTAS/CONFIG BASE ===
 # DATA_DIR debe existir ANTES del login/registro
-DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
+DATA_DIR = pathlib.Path(os.environ.get("DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # API base (Slack, backend)
