@@ -32,6 +32,28 @@ ACC_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------- utilidades ----------
 
+def _safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+def _safe_sample(population, k):
+    """
+    Devuelve una muestra sin reemplazo de tamaño k, acotando k a [0, n].
+    No falla si k es None/negativo/mayor al tamaño. Convierte a list por si es set/Index.
+    """
+    pop_list = list(population)
+    n = len(pop_list)
+    kk = _safe_int(k, 0)
+    if kk < 0:
+        kk = 0
+    if kk > n:
+        kk = n
+    if kk == 0:
+        return []
+    return random.sample(pop_list, kk)
+
 def _safe_read(path: Path, cols: list[str] | None = None) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame(columns=cols or [])
@@ -327,7 +349,7 @@ def register_new_account(
     # Asignar SKUs del catálogo
     total_skus = skus_df["sku_id"].tolist()
     k = max(1, int(len(total_skus) * float(sku_fraction)))
-    chosen_skus = sorted(random.sample(total_skus, k))
+    chosen_skus = sorted(_safe_sample(total_skus, k))
     sku_map_rows = pd.DataFrame([{"org_id": org_id, "sku_id": sid} for sid in chosen_skus])
     _append(sku_map_rows, ACC_DIR / "org_sku_map.csv")
 

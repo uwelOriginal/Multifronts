@@ -124,8 +124,8 @@ def events_publish(body: PublishIn):
                 ]
                 if invite_url:
                     lines.append(f"Invitación al *workspace*: {invite_url}")
-                else:
-                    lines.append("_(Falta configurar SLACK_WORKSPACE_INVITE_URL en el backend)_")
+                #else:
+                #    lines.append("_(Falta configurar SLACK_WORKSPACE_INVITE_URL en el backend)_")
                 lines.append(f"Canal de la organización: `#{chan_name}`")
                 text_msg = "\n".join(lines)
 

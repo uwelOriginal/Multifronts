@@ -178,6 +178,75 @@ def try_login(email: str, password: str, users_df: pd.DataFrame | None):
     display_name = str(dfrow["display_name"].iloc[0]) if "display_name" in dfrow.columns else email.strip()
     return User(email=email.strip(), org_id=org_id, role=role, display_name=display_name)
 
+# Resolver mail
+
+def _slug_org_for_channel(org_id: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9\-_]", "-", str(org_id).strip().lower())
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s[:70]
+
+def build_mailto_new_org(email: str | None, org_id: str | None) -> str | None:
+    """Genera un mailto con asunto/cuerpo prellenados, incluyendo:
+    - datos de cuenta/organización
+    - enlace de invitación al workspace (SLACK_WORKSPACE_INVITE_URL)
+    - enlace al canal de la organización (si existe)
+    """
+    try:
+        if not email or "@" not in email:
+            return None
+        org_id = (org_id or "").strip() or "(desconocida)"
+        api = _api_base()
+
+        # 1) Workspace invite (secrets/env)
+        invite_url = None
+        try:
+            if hasattr(st, "secrets"):
+                invite_url = st.secrets.get("SLACK_WORKSPACE_INVITE_URL", None)
+        except Exception:
+            print("No se mandó invitación a Slack")
+        if not invite_url:
+            invite_url = os.getenv("SLACK_WORKSPACE_INVITE_URL", "").strip() or None
+
+        # 2) Canal de la organización: nombre + web_url (si ya existe)
+        chan_name = f"mf-{_slug_org_for_channel(org_id)}"
+        chan_url  = None
+        try:
+            if api:
+                r = _req.get(f"{api}/debug/slack/channel_info", params={"org_id": org_id}, timeout=4)
+                if r.ok:
+                    data = r.json() or {}
+                    if isinstance(data.get("channel_name"), str) and data.get("channel_name"):
+                        chan_name = data["channel_name"]
+                    cu = data.get("web_url")
+                    if isinstance(cu, str) and cu.startswith("http"):
+                        chan_url = cu
+        except Exception:
+            pass
+
+        subject = f"Bienvenido a Multifronts · Organización {org_id}"
+        lines = [
+            f"Hola {email},",
+            "",
+            f"Tu cuenta fue creada en Multifronts.",
+            f"Organización: {org_id}",
+            "",
+            "Enlaces de acceso a Slack:"
+        ]
+        if invite_url:
+            lines.append(f"• Invitación al workspace: {invite_url}")
+        else:
+            lines.append("• Invitación al workspace: (configura SLACK_WORKSPACE_INVITE_URL en el backend)")
+        if chan_url:
+            lines.append(f"• Canal de la organización #{chan_name}: {chan_url}")
+        else:
+            lines.append(f"• Canal de la organización #{chan_name}: (pendiente de creación o acceso)")
+        lines += ["", "— Equipo Multifronts"]
+
+        body = "\n".join(lines)
+        return f"mailto:{_urlquote(email)}?subject={_urlquote(subject)}&body={_urlquote(body)}"
+    except Exception:
+        return None
+
 def _hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -331,6 +400,7 @@ def register_ui(data_dir: Path):
                 payload={"created_by": email.strip().lower()},
                 timeout=3.0,
             )
+            build_mailto_new_org(email.strip().lower(), org_id or "default")
         except Exception:
             pass
 
@@ -450,72 +520,3 @@ def resolve_org_webhook_oauth_first(orgs_df: pd.DataFrame | None, org_id: str) -
 
     # 3) Mapeo en orgs_df (CSV/DB)
     return resolve_org_webhook(orgs_df, org_id)
-
-# Resolver mail
-
-def _slug_org_for_channel(org_id: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9\-_]", "-", str(org_id).strip().lower())
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    return s[:70]
-
-def build_mailto_new_org(email: str | None, org_id: str | None) -> str | None:
-    """Genera un mailto con asunto/cuerpo prellenados, incluyendo:
-    - datos de cuenta/organización
-    - enlace de invitación al workspace (SLACK_WORKSPACE_INVITE_URL)
-    - enlace al canal de la organización (si existe)
-    """
-    try:
-        if not email or "@" not in email:
-            return None
-        org_id = (org_id or "").strip() or "(desconocida)"
-        api = _api_base()
-
-        # 1) Workspace invite (secrets/env)
-        invite_url = None
-        try:
-            if hasattr(st, "secrets"):
-                invite_url = st.secrets.get("SLACK_WORKSPACE_INVITE_URL", None)
-        except Exception:
-            pass
-        if not invite_url:
-            invite_url = os.getenv("SLACK_WORKSPACE_INVITE_URL", "").strip() or None
-
-        # 2) Canal de la organización: nombre + web_url (si ya existe)
-        chan_name = f"mf-{_slug_org_for_channel(org_id)}"
-        chan_url  = None
-        try:
-            if api:
-                r = _req.get(f"{api}/debug/slack/channel_info", params={"org_id": org_id}, timeout=4)
-                if r.ok:
-                    data = r.json() or {}
-                    if isinstance(data.get("channel_name"), str) and data.get("channel_name"):
-                        chan_name = data["channel_name"]
-                    cu = data.get("web_url")
-                    if isinstance(cu, str) and cu.startswith("http"):
-                        chan_url = cu
-        except Exception:
-            pass
-
-        subject = f"Bienvenido a Multifronts · Organización {org_id}"
-        lines = [
-            f"Hola {email},",
-            "",
-            f"Tu cuenta fue creada en Multifronts.",
-            f"Organización: {org_id}",
-            "",
-            "Enlaces de acceso a Slack:"
-        ]
-        if invite_url:
-            lines.append(f"• Invitación al workspace: {invite_url}")
-        else:
-            lines.append("• Invitación al workspace: (configura SLACK_WORKSPACE_INVITE_URL en el backend)")
-        if chan_url:
-            lines.append(f"• Canal de la organización #{chan_name}: {chan_url}")
-        else:
-            lines.append(f"• Canal de la organización #{chan_name}: (pendiente de creación o acceso)")
-        lines += ["", "— Equipo Multifronts"]
-
-        body = "\n".join(lines)
-        return f"mailto:{_urlquote(email)}?subject={_urlquote(subject)}&body={_urlquote(body)}"
-    except Exception:
-        return None
