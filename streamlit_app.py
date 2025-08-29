@@ -123,7 +123,6 @@ def _slack_status(org_id: str) -> dict:
 def _slack_channel_info(org_id: str) -> dict:
     try:
         r = requests.get(f"{API_BASE}/debug/slack/channel_info", params={"org_id": org_id}, timeout=10)
-        print(org_id)
         return r.json()
     except Exception as e:
         return {"ok": False, "error": str(e)}

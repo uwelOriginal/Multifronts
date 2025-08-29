@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Iterable, List
 import argparse
 import random
 import re
@@ -32,27 +33,43 @@ ACC_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------- utilidades ----------
 
-def _safe_int(x, default=0):
+def _safe_int(x, default=0) -> int:
     try:
         return int(x)
     except Exception:
         return default
 
-def _safe_sample(population, k):
+def ensure_nonempty_selection(population: Iterable, k: int | None, min_k: int = 1) -> List:
     """
-    Devuelve una muestra sin reemplazo de tamaño k, acotando k a [0, n].
-    No falla si k es None/negativo/mayor al tamaño. Convierte a list por si es set/Index.
+    Devuelve una muestra sin reemplazo de tamaño clamp(k, min_k..n).
+    - Si la población está vacía → ValueError (caso de datos mal cargados).
+    - Si k es None/negativo -> min_k.
+    - Si k > n -> n.
     """
-    pop_list = list(population)
-    n = len(pop_list)
-    kk = _safe_int(k, 0)
-    if kk < 0:
-        kk = 0
-    if kk > n:
-        kk = n
-    if kk == 0:
-        return []
-    return random.sample(pop_list, kk)
+    items = list(population)
+    n = len(items)
+    if n == 0:
+        raise ValueError("No hay elementos en la población para seleccionar (población vacía).")
+    kk = _safe_int(k, min_k)
+    kk = max(min_k, kk)
+    kk = min(kk, n)
+    if kk == n:
+        return items.copy()
+    # usa random.sample sin reemplazo
+    return random.sample(items, kk)
+
+def safe_choice(population: Iterable, rng=None):
+    """
+    Elige 1 elemento de 'population'. Falla con mensaje claro si está vacía.
+    Soporta numpy Generator (rng) o random.choice como fallback.
+    """
+    items = list(population)
+    if not items:
+        raise ValueError("safe_choice recibió una población vacía.")
+    if rng is not None and hasattr(rng, "choice"):
+        # numpy Generator.choice acepta listas directamente
+        return rng.choice(items)
+    return random.choice(items)
 
 def _safe_read(path: Path, cols: list[str] | None = None) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
@@ -349,7 +366,7 @@ def register_new_account(
     # Asignar SKUs del catálogo
     total_skus = skus_df["sku_id"].tolist()
     k = max(1, int(len(total_skus) * float(sku_fraction)))
-    chosen_skus = sorted(_safe_sample(total_skus, k))
+    chosen_skus  = sorted(ensure_nonempty_selection(total_skus, k, min_k=1))
     sku_map_rows = pd.DataFrame([{"org_id": org_id, "sku_id": sid} for sid in chosen_skus])
     _append(sku_map_rows, ACC_DIR / "org_sku_map.csv")
 
@@ -395,7 +412,7 @@ def register_new_account(
     promo_rows = []
     for sid in stores_app["store_id"]:
         for _ in range(2):
-            sku = rng.choice(chosen_skus)
+            sku = safe_choice(chosen_skus, rng)
             start_idx = int(rng.integers(0, max(1, days - 10)))
             duration = int(rng.integers(6, 10))
             uplift = float(np.round(rng.uniform(1.2, 1.8), 2))
@@ -450,6 +467,7 @@ def register_new_account(
     recent_sales = sales_all[sales_all["date"] >= str(current_date - timedelta(days=28))]
     avg_recent = recent_sales.groupby(["store_id","sku_id"])["units_sold"].mean().reset_index().rename(columns={"units_sold":"avg_daily_sales_28d"})
     avg_recent = avg_recent[avg_recent["store_id"].isin(stores_app["store_id"]) & avg_recent["sku_id"].isin(chosen_skus)]
+    
     if not avg_recent.empty:
         doc = rng.uniform(2, 60, size=len(avg_recent))
         low_idx = rng.choice(len(doc), size=max(1, int(0.10 * len(doc))), replace=False)
