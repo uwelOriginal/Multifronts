@@ -35,6 +35,7 @@ from urllib.parse import quote as _urlquote
 import requests as _req
 
 EMAIL_RX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+chosen_dir = Path(st.session_state.get("DATA_DIR") or os.getenv("DATA_DIR", "data")).expanduser().resolve()
 
 @dataclass
 class User:
@@ -256,24 +257,28 @@ def _validate_reg_secret(secret: str) -> bool:
     return bool(cfg) and _hash((secret or "").strip()) == cfg.strip()
 
 def _run_generator_register(email: str, password: str, org_name: str, stores: int = 2, sku_fraction: float = 0.35):
-    # Intento 1: import directo
     try:
-        import importlib
-        gen = importlib.import_module("generate_data")
-        if hasattr(gen, "register_new_account"):
-            org_id = gen.register_new_account(
-                data_dir=Path("./data"),
+        import importlib.util
+        from pathlib import Path
+        here = Path(__file__).resolve().parent
+        cand = (here / "generate_data.py") if (here / "generate_data.py").exists() else (here.parent / "generate_data.py")
+        if cand.exists():
+            spec = importlib.util.spec_from_file_location("generate_data_local", str(cand))
+            mod = importlib.util.module_from_spec(spec)  # type: ignore
+            assert spec and spec.loader
+            spec.loader.exec_module(mod)  # type: ignore
+            org_id = mod.register_new_account(
+                data_dir=chosen_dir,
                 email=email,
                 password=password,
                 org_name=org_name,
                 stores_count=stores,
                 sku_fraction=sku_fraction,
             )
-            return True, "Cuenta creada.", org_id
     except Exception:
-        pass
+        pass  # cae al plan B CLI
 
-    # Intento 2: CLI
+    # Plan B: CLI en el cwd donde está generate_data.py
     try:
         gen_path = Path.cwd() / "generate_data.py"
         if not gen_path.exists():
@@ -290,9 +295,8 @@ def _run_generator_register(email: str, password: str, org_name: str, stores: in
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if res.returncode != 0:
             return False, f"Error al registrar: {res.stderr.strip() or res.stdout.strip()}", None
-        out = res.stdout + "\n" + res.stderr
         org_id = None
-        for line in out.splitlines():
+        for line in (res.stdout + "\n" + res.stderr).splitlines():
             if line.startswith("ORG_ID="):
                 org_id = line.split("=", 1)[1].strip()
                 break
@@ -376,11 +380,18 @@ def register_ui(data_dir: Path):
         except Exception as e:
             errors.append(f"create_user: {e}")
 
+        # 1) migra los CSV (orgs/users/mapas) a Neon, por si son nuevos
+        try:
+            migrate_from_csv(chosen_dir)
+        except Exception as e:
+            errors.append(f"migrate_from_csv: {e}")
+            st.warning("No se pudo migrar los CSV a Neon.")
+            
         # ---- Sync mapas para la org recién creada (idempotente) ----
         added_stores = 0
         added_skus = 0
         try:
-            added_stores, added_skus = sync_org_maps_from_csv(org_id or "default", Path("./data"))
+            added_stores, added_skus = sync_org_maps_from_csv(org_id or "default", chosen_dir)
         except Exception as e:
             errors.append(f"sync_maps: {e}")
 

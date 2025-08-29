@@ -67,11 +67,11 @@ try:
 except Exception:
     psycopg = None  # si no está instalado, desactivamos live updates y avisamos
 
-# 🔧 aliasa el módulo queue para evitar UnboundLocalError
+# Aliasa el módulo queue para evitar UnboundLocalError
 import re, threading
 import queue as pyqueue
 
-# === NEW: helper para detectar historial en Neon ===
+# === Helper para detectar historial en Neon ===
 from sqlalchemy import text
 
 @st.cache_data(show_spinner=False, ttl=120)

@@ -30,13 +30,14 @@ def _fmt_line(row: dict) -> str:
         store = row.get("store_id")
         return f"- {actor} aprobó *PEDIDO* • SKU `{sku}` → Sucursal `{store}` • +{qty} uds"
 
-    if kind.startswith("transfer"):
+    elif kind.startswith("transfer"):
         from_store = row.get("from_store")
         to_store = row.get("to_store")
         return f"- {actor} aprobó *TRANSFERENCIA* • SKU `{sku}` • `{from_store}` → `{to_store}` • {qty} uds"
-
-    target = row.get("store_id") or f"{row.get('from_store')}→{row.get('to_store')}"
-    return f"- {actor} aprobó *MOVIMIENTO* • SKU `{sku}` • {target} • {qty} uds"
+    
+    else:
+        target = row.get("store_id") or f"{row.get('from_store')}→{row.get('to_store')}"
+        return f"- {actor} aprobó *MOVIMIENTO* • SKU `{sku}` • {target} • {qty} uds"
 
 def _build_text(payload) -> str:
     """Texto estilo 'manual' (solo para fallback al webhook)."""

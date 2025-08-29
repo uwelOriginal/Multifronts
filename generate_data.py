@@ -32,12 +32,127 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 ACC_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------- utilidades ----------
+from pathlib import Path
+import os
+import pandas as pd
+
+def _abs_data_dir() -> Path:
+    # 1) ENV
+    env = os.getenv("DATA_DIR", "").strip()
+    if env:
+        return Path(env).resolve()
+
+    # 2) secrets["data"]["dir"] si estás en Streamlit (no falla si no existe)
+    try:
+        import streamlit as st  # noqa
+        dd = st.secrets.get("data", {}).get("dir")
+        if dd:
+            return Path(dd).resolve()
+    except Exception:
+        pass
+
+    # 3) fallback: junto al código
+    # /mount/src/multifronts/data o /opt/render/project/src/data
+    here = Path(__file__).resolve().parent
+    for cand in [
+        here / "data",
+        here.parent / "data",
+        Path("/opt/render/project/src/data"),
+    ]:
+        if cand.exists():
+            return cand.resolve()
+    return here  # último recurso
+
+def _load_skus_from_csv() -> list[str]:
+    """Intenta leer SKUs desde CSV; retorna [] si no hay archivo o está vacío."""
+    try:
+        base = _abs_data_dir()
+        for name in ["skus.csv", "catalog_skus.csv", "SKU.csv"]:
+            p = base / name
+            if p.exists():
+                df = pd.read_csv(p)
+                # intenta detectar columnas típicas
+                for col in ["sku_id", "sku", "SKU", "id", "codigo"]:
+                    if col in df.columns and not df[col].dropna().empty:
+                        return sorted(df[col].astype(str).unique().tolist())
+    except Exception:
+        pass
+    return []
+
+def _synthetic_skus(n: int = 100) -> list[str]:
+    return [f"SKU{str(i).zfill(3)}" for i in range(1, n + 1)]
+
+def load_total_skus_or_fallback() -> tuple[list[str], str]:
+    """
+    Intenta SKUs desde Neon -> CSV -> sintético.
+    Devuelve (skus, fuente) para log.
+    """
+    skus = _load_skus_from_csv()
+    if skus:
+        return skus, "csv"
+    return _synthetic_skus(100), "synthetic"
 
 def _safe_int(x, default=0) -> int:
     try:
         return int(x)
     except Exception:
         return default
+    
+
+# --- NUEVO: asegurar dataset base en el data_dir elegido ---
+
+def _ensure_dataset_files(base: Path) -> None:
+    """Crea CSVs vacíos (con encabezados) si faltan; y garantiza que existan
+    'skus.csv' y 'stores.csv' mínimas para poder generar ventas/inventario."""
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "accounts").mkdir(parents=True, exist_ok=True)
+
+    # Cabeceras mínimas
+    skeletons = {
+        "stores.csv": ["store_id","store_code","store_name","region","lat","lon"],
+        "skus.csv": ["sku_id","sku_name","category","abc_class","unit_cost","unit_price","shelf_life_days"],
+        "promotions.csv": ["store_id","sku_id","start_date","end_date","uplift_factor","name"],
+        "lead_times.csv": ["store_id","sku_id","lead_time_mean_days","lead_time_std_days"],
+        "sales.csv": ["date","store_id","sku_id","units_sold"],
+        "inventory_snapshot.csv": ["date","store_id","sku_id","on_hand_units"],
+        "store_distances.csv": ["from_store","to_store","distance_km"],
+    }
+    for name, cols in skeletons.items():
+        p = base / name
+        if not p.exists() or p.stat().st_size == 0:
+            pd.DataFrame(columns=cols).to_csv(p, index=False)
+
+    # Asegura headers de archivos operativos
+    # (usa tu helper existente; lo dejamos tal cual)
+    _ensure_headers()
+
+def _bootstrap_min_catalogs_if_needed(base: Path, rng: np.random.Generator) -> None:
+    """Si 'skus.csv' está vacío, genera un catálogo mínimo de ~60 SKUs.
+       'stores.csv' puede empezar vacío porque las tiendas nuevas se agregan por organización."""
+    skus_p = base / "skus.csv"
+    need_skus = (not skus_p.exists()) or (skus_p.stat().st_size == 0)
+    if need_skus:
+        # categorías y SKUs básicos
+        categories = _random_categories(5, 8)
+        rows = []
+        for i in range(1, 61):
+            sku_id = f"SKU{str(i).zfill(3)}"
+            cat = rng.choice(categories)
+            abc = rng.choice(list("ABC"), p=[0.2, 0.5, 0.3])
+            cost = float(np.round(rng.uniform(10, 120), 2))
+            margin = rng.uniform(0.25, 0.6)
+            price = float(np.round(cost * (1 + margin), 2))
+            shelf = int(rng.integers(60, 360))
+            rows.append({
+                "sku_id": sku_id,
+                "sku_name": f"Producto {sku_id}",
+                "category": cat,
+                "abc_class": abc,
+                "unit_cost": cost,
+                "unit_price": price,
+                "shelf_life_days": shelf,
+            })
+        pd.DataFrame(rows).to_csv(skus_p, index=False)
 
 def ensure_nonempty_selection(population: Iterable, k: int | None, min_k: int = 1) -> List:
     """
@@ -328,26 +443,39 @@ def register_new_account(
     stores_count: int = 2,
     sku_fraction: float = 0.35,
 ) -> str:
+    # --- Normaliza rutas para este llamado ---
+    global DATA_DIR, ACC_DIR
+    DATA_DIR = Path(data_dir).expanduser().resolve()
+    ACC_DIR  = DATA_DIR / "accounts"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ACC_DIR.mkdir(parents=True, exist_ok=True)
+
+    # dataset base (archivos y catálogos mínimos)
+    _ensure_dataset_files(DATA_DIR)
+    _bootstrap_min_catalogs_if_needed(DATA_DIR, rng)
+
+    # --- Validaciones de entrada ---
     assert EMAIL_RX.match(email), "Email inválido"
     assert password and len(password) >= 6, "Contraseña inválida"
     org_name = org_name.strip() or email.split("@")[1].split(".")[0].title()
     org_id = _slugify(org_name)
 
-    # Cargar tablas actuales
+    # --- Cargar CSVs actuales (si están vacíos, serán DataFrames vacíos) ---
     users = _safe_read(ACC_DIR / "users.csv", ["email","password","org_id","role","display_name"])
     orgs  = _safe_read(ACC_DIR / "orgs.csv",  ["org_id","org_name","slack_webhook"])
     org_store_map = _safe_read(ACC_DIR / "org_store_map.csv", ["org_id","store_id"])
     org_sku_map   = _safe_read(ACC_DIR / "org_sku_map.csv",   ["org_id","sku_id"])
 
     stores_df = _safe_read(DATA_DIR / "stores.csv", ["store_id","store_code","store_name","region","lat","lon"])
-    skus_df   = _safe_read(DATA_DIR / "skus.csv",   ["sku_id","sku_name","category","abc_class","unit_cost","unit_price","shelf_life_days"])
+    skus_df   = _safe_read(DATA_DIR / "skus.csv",
+                           ["sku_id","sku_name","category","abc_class","unit_cost","unit_price","shelf_life_days"])
     promos_df = _safe_read(DATA_DIR / "promotions.csv", ["store_id","sku_id","start_date","end_date","uplift_factor","name"])
-    sales_df  = _safe_read(DATA_DIR / "sales.csv",  ["date","store_id","sku_id","units_sold"])
+    sales_df  = _safe_read(DATA_DIR / "sales.csv",      ["date","store_id","sku_id","units_sold"])
     inv_df    = _safe_read(DATA_DIR / "inventory_snapshot.csv", ["date","store_id","sku_id","on_hand_units"])
     lt_df     = _safe_read(DATA_DIR / "lead_times.csv", ["store_id","sku_id","lead_time_mean_days","lead_time_std_days"])
     dist_df   = _safe_read(DATA_DIR / "store_distances.csv", ["from_store","to_store","distance_km"])
 
-    # org_id único (sufijo si existe)
+    # --- org_id único ---
     base_id = org_id
     suffix = 1
     if not orgs.empty:
@@ -355,43 +483,90 @@ def register_new_account(
             suffix += 1
             org_id = f"{base_id}-{suffix}"
 
-    # Crear org + usuario
+    # --- Crear org + user (CSV) ---
     org_row = pd.DataFrame([{"org_id": org_id, "org_name": org_name, "slack_webhook": ""}])
     _append(org_row, ACC_DIR / "orgs.csv")
 
-    display_name = email.split("@")[0].title()
-    user_row = pd.DataFrame([{"email": email, "password": password, "org_id": org_id, "role": "admin", "display_name": display_name}])
+    user_row = pd.DataFrame([{
+        "email": email.strip().lower(),
+        "password": password,              # (hashéalo si quieres, aquí respetamos tu flujo)
+        "org_id": org_id,
+        "role": "admin",
+        "display_name": email.split("@")[0].title()
+    }])
     _append(user_row, ACC_DIR / "users.csv")
 
-    # Asignar SKUs del catálogo
-    total_skus = skus_df["sku_id"].tolist()
+    # --- Selección de SKUs para la nueva org ---
+    total_skus = sorted(skus_df["sku_id"].astype(str).unique().tolist()) if not skus_df.empty else []
+    if not total_skus:
+        # Cinturón y tirantes (si por alguna razón skus_df quedó vacío)
+        total_skus, _src = load_total_skus_or_fallback()
+        if not total_skus:
+            total_skus = [f"SKU{str(i).zfill(3)}" for i in range(1, 61)]
+        # también persistimos al CSV si veníamos realmente sin catálogo
+        if skus_df.empty:
+            # construye un mini catálogo a partir de total_skus
+            categories = _random_categories(5, 8)
+            rows = []
+            for sid in total_skus:
+                cat = rng.choice(categories)
+                abc = rng.choice(list("ABC"), p=[0.2, 0.5, 0.3])
+                cost = float(np.round(rng.uniform(10, 120), 2))
+                margin = rng.uniform(0.25, 0.6)
+                price = float(np.round(cost * (1 + margin), 2))
+                shelf = int(rng.integers(60, 360))
+                rows.append({
+                    "sku_id": sid,
+                    "sku_name": f"Producto {sid}",
+                    "category": cat,
+                    "abc_class": abc,
+                    "unit_cost": cost,
+                    "unit_price": price,
+                    "shelf_life_days": shelf,
+                })
+            pd.DataFrame(rows).to_csv(DATA_DIR / "skus.csv", index=False)
+            skus_df = pd.read_csv(DATA_DIR / "skus.csv")
+
     k = max(1, int(len(total_skus) * float(sku_fraction)))
-    chosen_skus  = sorted(ensure_nonempty_selection(total_skus, k, min_k=1))
+    chosen_skus = sorted(ensure_nonempty_selection(total_skus, k, min_k=1))
     sku_map_rows = pd.DataFrame([{"org_id": org_id, "sku_id": sid} for sid in chosen_skus])
     _append(sku_map_rows, ACC_DIR / "org_sku_map.csv")
 
-    # Crear tiendas NUEVAS con ID por org + nombres de estados MX
-    base_lat, base_lon = 25.6866, -100.3161
-    state_names = _pick_states(int(stores_count))
-    new_stores = []
-    for i, state in enumerate(state_names, start=1):
-        store_code = f"S{i:02d}"  # empieza en S01 por org
-        store_id = f"{org_id}-{store_code}"
-        new_stores.append({
-            "store_id": store_id,
-            "store_code": store_code,
-            "store_name": state,
-            "region": rng.choice(["Norte","Centro","Sur"]),
-            "lat": float(base_lat + rng.normal(0, 0.15)),
-            "lon": float(base_lon + rng.normal(0, 0.15)),
+    # --- Crear tiendas para la nueva org ---
+    # IDs únicos por org: {org}-S{nn}
+    next_seq = 1
+    if not stores_df.empty:
+        # Busca el siguiente consecutivo para esta org
+        used = stores_df[stores_df["store_id"].str.startswith(f"{org_id}-S")]["store_id"].tolist()
+        if used:
+            nums = []
+            for sid in used:
+                try:
+                    nums.append(int(sid.split("-S")[-1]))
+                except Exception:
+                    pass
+            if nums:
+                next_seq = max(nums) + 1
+    states = _pick_states(stores_count)
+    stores_app = []
+    for i in range(stores_count):
+        code = f"S{str(next_seq + i).zfill(2)}"
+        sid  = f"{org_id}-{code}"
+        stores_app.append({
+            "store_id": sid,
+            "store_code": code,
+            "store_name": f"{org_name} {states[i]}",
+            "region": states[i],
+            "lat": float(np.round(rng.uniform(14.5, 32.7), 5)),
+            "lon": float(np.round(rng.uniform(-117.1, -86.7), 5)),
         })
-    stores_app = pd.DataFrame(new_stores)
+    stores_app = pd.DataFrame(stores_app)
     _append(stores_app, DATA_DIR / "stores.csv")
 
     store_map_rows = pd.DataFrame([{"org_id": org_id, "store_id": row["store_id"]} for _, row in stores_app.iterrows()])
     _append(store_map_rows, ACC_DIR / "org_store_map.csv")
 
-    # Ventana temporal coherente con dataset actual
+    # --- Ventana temporal para ventas/stock ---
     if not sales_df.empty:
         min_d = pd.to_datetime(sales_df["date"]).min().date()
         max_d = pd.to_datetime(sales_df["date"]).max().date()
